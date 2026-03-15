@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import fitz
 import json
 import asyncio
+import os
 from google import genai
 
 app = FastAPI()
@@ -14,7 +15,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY = "AIzaSyDfdC2sPhc_aM08GFHl7-6h3ANDwozr9x4"
+API_KEY = os.getenv("GOOGLE_API_KEY")
 client = genai.Client(api_key=API_KEY)
 
 def extract_text(file_bytes: bytes) -> str:
@@ -39,7 +40,6 @@ Return ONLY a valid JSON array, no markdown, no extra text:
 Text: {text[:1500]}"""
 
 def call_gemini(prompt: str) -> str:
-    # ✅ Full model paths from your list
     models = [
         "models/gemini-2.0-flash-lite",
         "models/gemini-2.0-flash",
