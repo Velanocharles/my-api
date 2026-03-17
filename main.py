@@ -25,19 +25,30 @@ def extract_text(file_bytes: bytes) -> str:
 def build_prompt(quiz_type: str, question_count: int, text: str) -> str:
     if quiz_type == "multiple_choice":
         return f"""Generate {question_count} multiple choice questions from this text.
-Return ONLY a valid JSON array, no markdown, no extra text:
-[{{"question": "...", "choices": ["A","B","C","D"], "answer": "A"}}]
-Text: {text[:1500]}"""
+Return ONLY a valid JSON array, no markdown, no extra text.
+IMPORTANT:
+- choices must be the FULL answer text, NOT letters like A, B, C, D
+- answer must EXACTLY match one of the choices word for word
+- do NOT include letters or numbering in the choices
+Example format:
+[{{"question": "What is the capital of France?", "choices": ["Paris", "London", "Berlin", "Madrid"], "answer": "Paris"}}]
+Text: {text[:3000]}"""
+
     elif quiz_type == "true_or_false":
         return f"""Generate {question_count} true or false questions from this text.
-Return ONLY a valid JSON array, no markdown, no extra text:
-[{{"question": "...", "choices": ["True","False"], "answer": "True"}}]
-Text: {text[:1500]}"""
+Return ONLY a valid JSON array, no markdown, no extra text.
+IMPORTANT: answer must be exactly "True" or "False"
+Example format:
+[{{"question": "The Earth is round.", "choices": ["True", "False"], "answer": "True"}}]
+Text: {text[:3000]}"""
+
     elif quiz_type == "identification":
         return f"""Generate {question_count} identification questions from this text.
-Return ONLY a valid JSON array, no markdown, no extra text:
-[{{"question": "...", "answer": "exact answer"}}]
-Text: {text[:1500]}"""
+Return ONLY a valid JSON array, no markdown, no extra text.
+IMPORTANT: answer must be a short exact phrase from the text
+Example format:
+[{{"question": "Who discovered gravity?", "answer": "Isaac Newton"}}]
+Text: {text[:3000]}"""
 
 def call_gemini(prompt: str) -> str:
     models = [
