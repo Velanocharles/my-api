@@ -15,8 +15,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-API_KEY = os.getenv("GOOGLE_API_KEY")
-client = genai.Client(api_key=API_KEY)
+API_KEYS = [
+    os.getenv("GOOGLE_API_KEY"),
+    os.getenv("GOOGLE_API_KEY_2"),
+]
 
 def extract_text(file_bytes: bytes) -> str:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
@@ -58,24 +60,29 @@ def call_gemini(prompt: str) -> str:
     ]
 
     last_error = None
-    for model_name in models:
-        try:
-            print(f"⏳ Trying model: {model_name}")
-            response = client.models.generate_content(
-                model=model_name,
-                contents=prompt
-            )
-            print(f"✅ Success with model: {model_name}")
-            return response.text
-        except Exception as e:
-            if "429" in str(e) or "404" in str(e):
-                print(f"❌ {model_name} failed, trying next...")
-                last_error = e
-                continue
-            else:
-                raise
+    # ✅ Loop through each API key
+    for api_key in API_KEYS:
+        if not api_key:
+            continue
+        client = genai.Client(api_key=api_key)
+        for model_name in models:
+            try:
+                print(f"⏳ Trying key ...{api_key[-6:]} with model: {model_name}")
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=prompt
+                )
+                print(f"✅ Success with model: {model_name}")
+                return response.text
+            except Exception as e:
+                if "429" in str(e) or "404" in str(e):
+                    print(f"❌ {model_name} failed, trying next...")
+                    last_error = e
+                    continue
+                else:
+                    raise
 
-    raise last_error
+    raise last_error or Exception("All API keys and models exhausted!")
 
 @app.post("/generate-quiz")
 async def generate_quiz(
