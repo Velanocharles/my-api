@@ -26,30 +26,54 @@ def extract_text(file_bytes: bytes) -> str:
 
 def build_prompt(quiz_type: str, question_count: int, text: str) -> str:
     if quiz_type == "multiple_choice":
-        return f"""Generate {question_count} multiple choice questions from this text.
-Return ONLY a valid JSON array, no markdown, no extra text.
-IMPORTANT:
-- choices must be the FULL answer text, NOT letters like A, B, C, D
-- answer must EXACTLY match one of the choices word for word
-- do NOT include letters or numbering in the choices
-Example format:
-[{{"question": "What is the capital of France?", "choices": ["Paris", "London", "Berlin", "Madrid"], "answer": "Paris"}}]
+        return f"""You are a teacher creating a HOTS (Higher Order Thinking Skills) quiz.
+Generate {question_count} multiple choice questions from this text.
+
+STRICT RULES:
+- Questions must require ANALYSIS, EVALUATION, or APPLICATION — not just recall
+- Use question starters like: "Why", "How", "What would happen if", "Which best explains", "What is the most likely reason"
+- Each choice must be SHORT (1-5 words only)
+- All 4 choices must be plausible but only one is correct
+- Answer must EXACTLY match one of the choices word for word
+- No letters (A, B, C, D) in choices
+- Return ONLY a valid JSON array, no markdown, no extra text
+
+Example:
+[{{"question": "Why does water expand when frozen?", "choices": ["Molecules slow down", "Hydrogen bonds form", "Density increases", "Heat is absorbed"], "answer": "Hydrogen bonds form"}}]
+
 Text: {text[:3000]}"""
 
     elif quiz_type == "true_or_false":
-        return f"""Generate {question_count} true or false questions from this text.
-Return ONLY a valid JSON array, no markdown, no extra text.
-IMPORTANT: answer must be exactly "True" or "False"
-Example format:
-[{{"question": "The Earth is round.", "choices": ["True", "False"], "answer": "True"}}]
+        return f"""You are a teacher creating a HOTS (Higher Order Thinking Skills) quiz.
+Generate {question_count} true or false questions from this text.
+
+STRICT RULES:
+- Questions must require ANALYSIS or EVALUATION — not just memorization
+- Avoid simple fact-based questions
+- Use statements that require the student to think critically
+- Mix true and false answers roughly equally
+- Answer must be exactly "True" or "False"
+- Return ONLY a valid JSON array, no markdown, no extra text
+
+Example:
+[{{"question": "Increasing temperature always increases the rate of a chemical reaction.", "choices": ["True", "False"], "answer": "False"}}]
+
 Text: {text[:3000]}"""
 
     elif quiz_type == "identification":
-        return f"""Generate {question_count} identification questions from this text.
-Return ONLY a valid JSON array, no markdown, no extra text.
-IMPORTANT: answer must be a short exact phrase from the text
-Example format:
-[{{"question": "Who discovered gravity?", "answer": "Isaac Newton"}}]
+        return f"""You are a teacher creating a HOTS (Higher Order Thinking Skills) quiz.
+Generate {question_count} identification questions from this text.
+
+STRICT RULES:
+- Questions must require the student to APPLY or ANALYZE concepts, not just recall terms
+- Use question starters like: "What term describes", "Identify the concept", "What process explains"
+- Answer must be a SHORT and SPECIFIC phrase (1-4 words only)
+- Answer must come directly from the text
+- Return ONLY a valid JSON array, no markdown, no extra text
+
+Example:
+[{{"question": "What process describes plants converting sunlight into food?", "answer": "Photosynthesis"}}]
+
 Text: {text[:3000]}"""
 
 def call_gemini(prompt: str) -> str:
@@ -60,7 +84,6 @@ def call_gemini(prompt: str) -> str:
     ]
 
     last_error = None
-    # ✅ Loop through each API key
     for api_key in API_KEYS:
         if not api_key:
             continue
