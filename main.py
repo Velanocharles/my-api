@@ -67,12 +67,16 @@ Generate {question_count} identification questions from this text.
 STRICT RULES:
 - Questions must require the student to APPLY or ANALYZE concepts, not just recall terms
 - Use question starters like: "What term describes", "Identify the concept", "What process explains"
-- Answer must be a SHORT and SPECIFIC phrase (1-4 words only)
+- Answer MUST be exactly 1 or 2 words only — a single term or concept (e.g. "Photosynthesis", "Natural Selection", "Osmosis")
+- NEVER write answers longer than 2 words — no phrases, no sentences, no articles
 - Answer must come directly from the text
 - Return ONLY a valid JSON array, no markdown, no extra text
 
 Example:
-[{{"question": "What process describes plants converting sunlight into food?", "answer": "Photosynthesis"}}]
+[
+  {{"question": "What process describes plants converting sunlight into food?", "answer": "Photosynthesis"}},
+  {{"question": "What term describes the gradual change in species over generations?", "answer": "Natural Selection"}}
+]
 
 Text: {text[:3000]}"""
 
