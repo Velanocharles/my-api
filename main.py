@@ -18,6 +18,7 @@ app.add_middleware(
 API_KEYS = [
     os.getenv("GOOGLE_API_KEY"),
     os.getenv("GOOGLE_API_KEY_2"),
+    os.getenv("GOOGLE_API_KEY_3"),
 ]
 
 def extract_text(file_bytes: bytes) -> str:
