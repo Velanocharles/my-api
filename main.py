@@ -28,7 +28,7 @@ def extract_text(file_bytes: bytes) -> str:
     return "".join(page.get_text() for page in doc)
 
 def build_prompt(quiz_type: str, question_count: int, text: str) -> str:
-    snippet = text[:3000]
+    snippet = text[:8000]
     if quiz_type == "multiple_choice":
         return f"""You are a teacher creating a HOTS quiz...
 Text: {snippet}"""
