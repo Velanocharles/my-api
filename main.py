@@ -26,9 +26,9 @@ API_KEYS = [
 ]
 
 MODELS = [
-    "models/gemini-2.0-flash-lite",
-    "models/gemini-2.0-flash",
     "models/gemini-2.5-flash",
+    "models/gemini-3.0-flash",
+    "models/gemini-3.1-flash-lite"
 ]
 
 
