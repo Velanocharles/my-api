@@ -4,6 +4,7 @@ import fitz
 import json
 import asyncio
 import os
+import time
 from google import genai
 
 app = FastAPI()
@@ -27,7 +28,7 @@ def extract_text(file_bytes: bytes) -> str:
     return "".join(page.get_text() for page in doc)
 
 def build_prompt(quiz_type: str, question_count: int, text: str) -> str:
-    snippet = text[:3000]  # limit to 3000 chars for memory efficiency
+    snippet = text[:3000]
     if quiz_type == "multiple_choice":
         return f"""You are a teacher creating a HOTS quiz...
 Text: {snippet}"""
@@ -60,14 +61,29 @@ def call_gemini(prompt: str) -> str:
                 print(f"✅ Success with model: {model_name}")
                 return response.text
             except Exception as e:
-                if "429" in str(e) or "404" in str(e):
+                if "503" in str(e) or "429" in str(e) or "404" in str(e):
                     last_error = e
                     continue
                 else:
                     raise
     raise last_error or Exception("All API keys and models exhausted!")
 
-# ---------------- Queue System for Starter Plan ----------------
+def call_gemini_with_retry(prompt, retries=3, delay=2):
+    last_error = None
+    for i in range(retries):
+        try:
+            return call_gemini(prompt)
+        except Exception as e:
+            if "503" in str(e):
+                last_error = e
+                print(f"⚠️ Gemini 503, retrying in {delay}s... ({i+1}/{retries})")
+                time.sleep(delay)
+                delay *= 2
+            else:
+                raise
+    raise last_error
+
+# ---------------- Queue System with Positions ----------------
 quiz_queue = asyncio.Queue()
 
 async def process_quiz_queue():
@@ -98,14 +114,17 @@ async def generate_quiz(
 
     prompt = build_prompt(quiz_type, question_count, text)
 
-    # Add to queue for sequential processing
-    future = asyncio.get_event_loop().create_future()
-    await quiz_queue.put((call_gemini, [prompt], future))
-    raw = await future  # wait until the quiz is generated
+    # Determine position in queue
+    position = quiz_queue.qsize() + 1
 
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    quiz = json.loads(raw)
-    return {"quiz": quiz, "quiz_type": quiz_type}
+    # Create future and add to queue
+    future = asyncio.get_event_loop().create_future()
+    await quiz_queue.put((call_gemini_with_retry, [prompt], future))
+
+    # Return position immediately
+    return {"status": "queued", "position": position, "message": "Your quiz is being generated"}
+
+    
 
 # ---------------- Render Starter-friendly server start ----------------
 if __name__ == "__main__":
@@ -113,7 +132,7 @@ if __name__ == "__main__":
 
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
-        "main:app",  # replace 'main' with your filename if different
+        "main:app",  # replace 'main' with your filename
         host="0.0.0.0",
         port=port,
         log_level="info",
