@@ -31,21 +31,86 @@ MODELS = [
     "models/gemini-2.5-flash",
 ]
 
+
 def extract_text(file_bytes: bytes) -> str:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     return "".join(page.get_text() for page in doc)
+
 
 def build_prompt(quiz_type: str, question_count: int, text: str) -> str:
     snippet = text[:8000]
     if not snippet.strip():
         return ""
+
+    base = (
+        f"You are a teacher creating a HOTS (Higher Order Thinking Skills) quiz.\n"
+        f"Return ONLY a valid JSON array with NO extra text, no markdown, no explanation.\n"
+        f"Do NOT include ```json or ``` anywhere in your response.\n"
+        f"Generate exactly {question_count} questions from the text below.\n\n"
+    )
+
     if quiz_type == "multiple_choice":
-        return f"You are a teacher creating a HOTS quiz...\nText: {snippet}"
+        format_instructions = (
+            "Each item must follow this exact JSON structure:\n"
+            "[\n"
+            "  {\n"
+            '    "question": "Your HOTS question here?",\n'
+            '    "choices": ["A. option1", "B. option2", "C. option3", "D. option4"],\n'
+            '    "answer": "A. option1"\n'
+            "  }\n"
+            "]"
+        )
+
     elif quiz_type == "true_or_false":
-        return f"You are a teacher creating a HOTS quiz...\nText: {snippet}"
+        format_instructions = (
+            "Each item must follow this exact JSON structure:\n"
+            "[\n"
+            "  {\n"
+            '    "question": "Your HOTS statement here.",\n'
+            '    "answer": "True"\n'
+            "  }\n"
+            "]"
+        )
+
     elif quiz_type == "identification":
-        return f"You are a teacher creating a HOTS quiz...\nText: {snippet}"
-    return ""
+        format_instructions = (
+            "Each item must follow this exact JSON structure:\n"
+            "[\n"
+            "  {\n"
+            '    "question": "Your HOTS question here?",\n'
+            '    "answer": "Exact answer here"\n'
+            "  }\n"
+            "]"
+        )
+
+    else:
+        return ""
+
+    return f"{base}{format_instructions}\n\nText:\n{snippet}"
+
+
+def extract_json(raw: str) -> str:
+    """Extract a JSON array or object from a response that may contain extra text."""
+    raw = raw.strip()
+
+    # Strip markdown code fences if present
+    raw = raw.replace("```json", "").replace("```", "").strip()
+
+    # Try to find a JSON array first, then object
+    for start_char, end_char in [("[", "]"), ("{", "}")]:
+        start = raw.find(start_char)
+        end = raw.rfind(end_char)
+        if start != -1 and end != -1 and end > start:
+            candidate = raw[start:end + 1]
+            try:
+                json.loads(candidate)
+                return candidate
+            except json.JSONDecodeError:
+                continue
+
+    # Return as-is and let the caller handle the error
+    return raw
+
 
 def call_gemini(prompt: str) -> str:
     last_error = None
@@ -71,7 +136,8 @@ def call_gemini(prompt: str) -> str:
                     raise
     raise last_error or Exception("All API keys and models exhausted!")
 
-def call_gemini_with_retry(prompt, retries=3, delay=2):
+
+def call_gemini_with_retry(prompt: str, retries: int = 3, delay: int = 2) -> str:
     last_error = None
     for i in range(retries):
         try:
@@ -87,8 +153,10 @@ def call_gemini_with_retry(prompt, retries=3, delay=2):
                 raise
     raise last_error
 
+
 # ---------------- Queue System ----------------
 quiz_queue = asyncio.Queue()
+
 
 async def process_quiz_queue():
     while True:
@@ -101,9 +169,11 @@ async def process_quiz_queue():
         finally:
             quiz_queue.task_done()
 
+
 @app.on_event("startup")
 async def startup_event():
     asyncio.create_task(process_quiz_queue())
+
 
 @app.post("/generate-quiz")
 async def generate_quiz(
@@ -130,28 +200,30 @@ async def generate_quiz(
 
         # Wait for quiz generation
         raw = await future
-        raw = raw.replace("```json", "").replace("```", "").strip()
 
-        if not raw:
+        if not raw or not raw.strip():
             return {"error": "Quiz generation failed: empty response from Gemini."}
 
+        # Clean and extract JSON from the response
+        cleaned = extract_json(raw)
+
         try:
-            quiz = json.loads(raw)
+            quiz = json.loads(cleaned)
         except json.JSONDecodeError as e:
-            print(f"❌ JSON decode failed: {raw}")
+            print(f"❌ JSON decode failed. Raw response:\n{raw}")
             return {"error": f"Failed to parse quiz JSON: {str(e)}"}
 
         return {"quiz": quiz, "quiz_type": quiz_type, "position": position}
 
     except Exception as e:
-        # Detect quota issues
         if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
             return {"error": "Gemini API quota exceeded. Please try later or upgrade plan."}
         print(f"❌ Unexpected error in generate_quiz: {str(e)}")
         return {"error": f"Unexpected error: {str(e)}"}
 
+
 # ---------------- Render Starter-friendly server start ----------------
-if __name__ == "__main__":
+if _name_ == "_main_":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info", reload=False)
