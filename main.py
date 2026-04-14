@@ -20,7 +20,7 @@ API_KEYS = [
     os.getenv("GOOGLE_API_KEY"),
     os.getenv("GOOGLE_API_KEY_2"),
     os.getenv("GOOGLE_API_KEY_3"),
-    os.getenv("GOOGLE_API_KEY_4"),  
+    os.getenv("GOOGLE_API_KEY_4"),
     os.getenv("GOOGLE_API_KEY_5"),
 ]
 
@@ -36,15 +36,15 @@ def extract_text(file_bytes: bytes) -> str:
 
 def build_prompt(quiz_type: str, question_count: int, text: str) -> str:
     snippet = text[:8000]
+    if not snippet.strip():
+        return ""
     if quiz_type == "multiple_choice":
-        return f"""You are a teacher creating a HOTS quiz...
-Text: {snippet}"""
+        return f"You are a teacher creating a HOTS quiz...\nText: {snippet}"
     elif quiz_type == "true_or_false":
-        return f"""You are a teacher creating a HOTS quiz...
-Text: {snippet}"""
+        return f"You are a teacher creating a HOTS quiz...\nText: {snippet}"
     elif quiz_type == "identification":
-        return f"""You are a teacher creating a HOTS quiz...
-Text: {snippet}"""
+        return f"You are a teacher creating a HOTS quiz...\nText: {snippet}"
+    return ""
 
 def call_gemini(prompt: str) -> str:
     last_error = None
@@ -108,15 +108,17 @@ async def startup_event():
 async def generate_quiz(
     file: UploadFile = File(...),
     quiz_type: str = Form(...),
-    question_count: int = Form(...)
+    question_count: int = Form(...),
 ):
     try:
         file_bytes = await file.read()
         text = extract_text(file_bytes)
         if not text.strip():
-            return {"error": "Could not extract text from PDF"}
+            return {"error": "Could not extract text from PDF or PDF is empty."}
 
         prompt = build_prompt(quiz_type, question_count, text)
+        if not prompt.strip():
+            return {"error": "Failed to build prompt. PDF may be unreadable or empty."}
 
         # Determine position in queue
         position = quiz_queue.qsize() + 1
@@ -125,7 +127,7 @@ async def generate_quiz(
         future = asyncio.get_event_loop().create_future()
         await quiz_queue.put((call_gemini_with_retry, [prompt], future))
 
-        # Wait for quiz generation to finish
+        # Wait for quiz generation
         raw = await future
         raw = raw.replace("```json", "").replace("```", "").strip()
 
@@ -138,14 +140,12 @@ async def generate_quiz(
             print(f"❌ JSON decode failed: {raw}")
             return {"error": f"Failed to parse quiz JSON: {str(e)}"}
 
-        # Return quiz JSON directly for Android
-        return {
-            "quiz": quiz,
-            "quiz_type": quiz_type,
-            "position": position
-        }
+        return {"quiz": quiz, "quiz_type": quiz_type, "position": position}
 
     except Exception as e:
+        # Detect quota issues
+        if "RESOURCE_EXHAUSTED" in str(e) or "429" in str(e):
+            return {"error": "Gemini API quota exceeded. Please try later or upgrade plan."}
         print(f"❌ Unexpected error in generate_quiz: {str(e)}")
         return {"error": f"Unexpected error: {str(e)}"}
 
@@ -153,10 +153,4 @@ async def generate_quiz(
 if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=port,
-        log_level="info",
-        reload=False
-    )
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info", reload=False)
