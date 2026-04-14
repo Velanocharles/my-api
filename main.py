@@ -22,6 +22,7 @@ API_KEYS = [
     os.getenv("GOOGLE_API_KEY_3"),
     os.getenv("GOOGLE_API_KEY_4"),
     os.getenv("GOOGLE_API_KEY_5"),
+    os.getenv("GOOGLE_API_KEY_6"),
 ]
 
 MODELS = [
