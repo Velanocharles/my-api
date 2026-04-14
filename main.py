@@ -21,7 +21,13 @@ API_KEYS = [
     os.getenv("GOOGLE_API_KEY_2"),
     os.getenv("GOOGLE_API_KEY_3"),
     os.getenv("GOOGLE_API_KEY_4"),  
-    os.getenv("GOOGLE_API_KEY_5"), 
+    os.getenv("GOOGLE_API_KEY_5"),
+]
+
+MODELS = [
+    "models/gemini-2.0-flash-lite",
+    "models/gemini-2.0-flash",
+    "models/gemini-2.5-flash",
 ]
 
 def extract_text(file_bytes: bytes) -> str:
@@ -41,17 +47,12 @@ Text: {snippet}"""
 Text: {snippet}"""
 
 def call_gemini(prompt: str) -> str:
-    models = [
-        "models/gemini-2.0-flash-lite",
-        "models/gemini-2.0-flash",
-        "models/gemini-2.5-flash",
-    ]
     last_error = None
     for api_key in API_KEYS:
         if not api_key:
             continue
         client = genai.Client(api_key=api_key)
-        for model_name in models:
+        for model_name in MODELS:
             try:
                 print(f"⏳ Trying key ...{api_key[-6:]} with model: {model_name}")
                 response = client.models.generate_content(
@@ -61,7 +62,8 @@ def call_gemini(prompt: str) -> str:
                 print(f"✅ Success with model: {model_name}")
                 return response.text
             except Exception as e:
-                if "503" in str(e) or "429" in str(e) or "404" in str(e):
+                if "503" in str(e) or "429" in str(e):
+                    print(f"⚠️ Model {model_name} failed: {e}, trying next model...")
                     last_error = e
                     continue
                 else:
@@ -74,16 +76,17 @@ def call_gemini_with_retry(prompt, retries=3, delay=2):
         try:
             return call_gemini(prompt)
         except Exception as e:
-            if "503" in str(e):
+            if "503" in str(e) or "429" in str(e):
                 last_error = e
-                print(f"⚠️ Gemini 503, retrying in {delay}s... ({i+1}/{retries})")
+                retry_time = getattr(e, "retryDelay", delay)
+                print(f"⚠️ Gemini busy/quota exceeded, retrying in {retry_time}s ({i+1}/{retries})")
                 time.sleep(delay)
                 delay *= 2
             else:
                 raise
     raise last_error
 
-# ---------------- Queue System with Positions ----------------
+# ---------------- Queue System ----------------
 quiz_queue = asyncio.Queue()
 
 async def process_quiz_queue():
@@ -122,7 +125,7 @@ async def generate_quiz(
         future = asyncio.get_event_loop().create_future()
         await quiz_queue.put((call_gemini_with_retry, [prompt], future))
 
-        # --- Wait for quiz generation to finish ---
+        # Wait for quiz generation to finish
         raw = await future
         raw = raw.replace("```json", "").replace("```", "").strip()
 
@@ -151,7 +154,7 @@ if __name__ == "__main__":
     import uvicorn
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
-        "main:app",  # replace 'main' with your filename
+        "main:app",
         host="0.0.0.0",
         port=port,
         log_level="info",
