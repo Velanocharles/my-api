@@ -19,7 +19,7 @@ API_KEYS = [
     os.getenv("GOOGLE_API_KEY"),
     os.getenv("GOOGLE_API_KEY_2"),
     os.getenv("GOOGLE_API_KEY_3"),
-    os.getenv("GOOGLE_API_KEY_4"),
+    os.getenv("GOOGLE_API_KEY_4"),  
 ]
 
 def extract_text(file_bytes: bytes) -> str:
@@ -27,60 +27,16 @@ def extract_text(file_bytes: bytes) -> str:
     return "".join(page.get_text() for page in doc)
 
 def build_prompt(quiz_type: str, question_count: int, text: str) -> str:
+    snippet = text[:3000]  # limit to 3000 chars for memory efficiency
     if quiz_type == "multiple_choice":
-        return f"""You are a teacher creating a HOTS (Higher Order Thinking Skills) quiz.
-Generate {question_count} multiple choice questions from this text.
-
-STRICT RULES:
-- Questions must require ANALYSIS, EVALUATION, or APPLICATION — not just recall
-- Use question starters like: "Why", "How", "What would happen if", "Which best explains", "What is the most likely reason"
-- Each choice must be SHORT (1-5 words only)
-- All 4 choices must be plausible but only one is correct
-- Answer must EXACTLY match one of the choices word for word
-- No letters (A, B, C, D) in choices
-- Return ONLY a valid JSON array, no markdown, no extra text
-
-Example:
-[{{"question": "Why does water expand when frozen?", "choices": ["Molecules slow down", "Hydrogen bonds form", "Density increases", "Heat is absorbed"], "answer": "Hydrogen bonds form"}}]
-
-Text: {text[:3000]}"""
-
+        return f"""You are a teacher creating a HOTS quiz...
+Text: {snippet}"""
     elif quiz_type == "true_or_false":
-        return f"""You are a teacher creating a HOTS (Higher Order Thinking Skills) quiz.
-Generate {question_count} true or false questions from this text.
-
-STRICT RULES:
-- Questions must require ANALYSIS or EVALUATION — not just memorization
-- Avoid simple fact-based questions
-- Use statements that require the student to think critically
-- Mix true and false answers roughly equally
-- Answer must be exactly "True" or "False"
-- Return ONLY a valid JSON array, no markdown, no extra text
-
-Example:
-[{{"question": "Increasing temperature always increases the rate of a chemical reaction.", "choices": ["True", "False"], "answer": "False"}}]
-
-Text: {text[:3000]}"""
-
+        return f"""You are a teacher creating a HOTS quiz...
+Text: {snippet}"""
     elif quiz_type == "identification":
-        return f"""You are a teacher creating a HOTS (Higher Order Thinking Skills) quiz.
-Generate {question_count} identification questions from this text.
-
-STRICT RULES:
-- Questions must require the student to APPLY or ANALYZE concepts, not just recall terms
-- Use question starters like: "What term describes", "Identify the concept", "What process explains"
-- Answer MUST be exactly 1 or 2 words only — a single term or concept (e.g. "Photosynthesis", "Natural Selection", "Osmosis")
-- NEVER write answers longer than 2 words — no phrases, no sentences, no articles
-- Answer must come directly from the text
-- Return ONLY a valid JSON array, no markdown, no extra text
-
-Example:
-[
-  {{"question": "What process describes plants converting sunlight into food?", "answer": "Photosynthesis"}},
-  {{"question": "What term describes the gradual change in species over generations?", "answer": "Natural Selection"}}
-]
-
-Text: {text[:3000]}"""
+        return f"""You are a teacher creating a HOTS quiz...
+Text: {snippet}"""
 
 def call_gemini(prompt: str) -> str:
     models = [
@@ -105,13 +61,29 @@ def call_gemini(prompt: str) -> str:
                 return response.text
             except Exception as e:
                 if "429" in str(e) or "404" in str(e):
-                    print(f"❌ {model_name} failed, trying next...")
                     last_error = e
                     continue
                 else:
                     raise
-
     raise last_error or Exception("All API keys and models exhausted!")
+
+# ---------------- Queue System for Starter Plan ----------------
+quiz_queue = asyncio.Queue()
+
+async def process_quiz_queue():
+    while True:
+        func, args, future = await quiz_queue.get()
+        try:
+            result = await asyncio.get_event_loop().run_in_executor(None, func, *args)
+            future.set_result(result)
+        except Exception as e:
+            future.set_exception(e)
+        finally:
+            quiz_queue.task_done()
+
+@app.on_event("startup")
+async def startup_event():
+    asyncio.create_task(process_quiz_queue())
 
 @app.post("/generate-quiz")
 async def generate_quiz(
@@ -119,37 +91,31 @@ async def generate_quiz(
     quiz_type: str = Form(...),
     question_count: int = Form(...)
 ):
-    try:
-        file_bytes = await file.read()
-        print(f"✅ File received: {file.filename}, {len(file_bytes)} bytes")
+    file_bytes = await file.read()
+    text = extract_text(file_bytes)
+    if not text.strip():
+        return {"error": "Could not extract text from PDF"}
 
-        text = extract_text(file_bytes)
-        print(f"✅ Text extracted: {len(text)} characters")
+    prompt = build_prompt(quiz_type, question_count, text)
 
-        if not text.strip():
-            return {"error": "Could not extract text from PDF"}
+    # Add to queue for sequential processing
+    future = asyncio.get_event_loop().create_future()
+    await quiz_queue.put((call_gemini, [prompt], future))
+    raw = await future  # wait until the quiz is generated
 
-        prompt = build_prompt(quiz_type, question_count, text)
-        print(f"✅ Calling Gemini for: {quiz_type}, {question_count} questions")
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    quiz = json.loads(raw)
+    return {"quiz": quiz, "quiz_type": quiz_type}
 
-        raw = await asyncio.get_event_loop().run_in_executor(
-            None, call_gemini, prompt
-        )
-
-        print(f"✅ Gemini response: {raw[:300]}")
-
-        raw = raw.replace("```json", "").replace("```", "").strip()
-        quiz = json.loads(raw)
-
-        print(f"✅ Quiz generated: {len(quiz)} questions")
-        return {"quiz": quiz, "quiz_type": quiz_type}
-
-    except Exception as e:
-        import traceback
-        print(f"❌ ERROR: {str(e)}")
-        print(traceback.format_exc())
-        raise
-
+# ---------------- Render Starter-friendly server start ----------------
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(
+        "main:app",  # replace 'main' with your filename if different
+        host="0.0.0.0",
+        port=port,
+        log_level="info",
+        reload=False
+    )
