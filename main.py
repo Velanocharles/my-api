@@ -106,31 +106,44 @@ async def generate_quiz(
     quiz_type: str = Form(...),
     question_count: int = Form(...)
 ):
-    file_bytes = await file.read()
-    text = extract_text(file_bytes)
-    if not text.strip():
-        return {"error": "Could not extract text from PDF"}
+    try:
+        file_bytes = await file.read()
+        text = extract_text(file_bytes)
+        if not text.strip():
+            return {"error": "Could not extract text from PDF"}
 
-    prompt = build_prompt(quiz_type, question_count, text)
+        prompt = build_prompt(quiz_type, question_count, text)
 
-    # Determine position in queue
-    position = quiz_queue.qsize() + 1
+        # Determine position in queue
+        position = quiz_queue.qsize() + 1
 
-    # Add the task to the queue
-    future = asyncio.get_event_loop().create_future()
-    await quiz_queue.put((call_gemini_with_retry, [prompt], future))
+        # Add the task to the queue
+        future = asyncio.get_event_loop().create_future()
+        await quiz_queue.put((call_gemini_with_retry, [prompt], future))
 
-    # --- Wait for quiz generation to finish ---
-    raw = await future
-    raw = raw.replace("```json", "").replace("```", "").strip()
-    quiz = json.loads(raw)
+        # --- Wait for quiz generation to finish ---
+        raw = await future
+        raw = raw.replace("```json", "").replace("```", "").strip()
 
-    # Return quiz JSON directly for Android
-    return {
-        "quiz": quiz,
-        "quiz_type": quiz_type,
-        "position": position  # optional for logging / UX
-    }
+        if not raw:
+            return {"error": "Quiz generation failed: empty response from Gemini."}
+
+        try:
+            quiz = json.loads(raw)
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON decode failed: {raw}")
+            return {"error": f"Failed to parse quiz JSON: {str(e)}"}
+
+        # Return quiz JSON directly for Android
+        return {
+            "quiz": quiz,
+            "quiz_type": quiz_type,
+            "position": position
+        }
+
+    except Exception as e:
+        print(f"❌ Unexpected error in generate_quiz: {str(e)}")
+        return {"error": f"Unexpected error: {str(e)}"}
 
 # ---------------- Render Starter-friendly server start ----------------
 if __name__ == "__main__":
