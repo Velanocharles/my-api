@@ -45,7 +45,6 @@ def call_gemini(prompt: str) -> str:
         "models/gemini-2.0-flash",
         "models/gemini-2.5-flash",
     ]
-
     last_error = None
     for api_key in API_KEYS:
         if not api_key:
@@ -117,19 +116,25 @@ async def generate_quiz(
     # Determine position in queue
     position = quiz_queue.qsize() + 1
 
-    # Create future and add to queue
+    # Add the task to the queue
     future = asyncio.get_event_loop().create_future()
     await quiz_queue.put((call_gemini_with_retry, [prompt], future))
 
-    # Return position immediately
-    return {"status": "queued", "position": position, "message": "Your quiz is being generated"}
+    # --- Wait for quiz generation to finish ---
+    raw = await future
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    quiz = json.loads(raw)
 
-    
+    # Return quiz JSON directly for Android
+    return {
+        "quiz": quiz,
+        "quiz_type": quiz_type,
+        "position": position  # optional for logging / UX
+    }
 
 # ---------------- Render Starter-friendly server start ----------------
 if __name__ == "__main__":
     import uvicorn
-
     port = int(os.environ.get("PORT", 8000))
     uvicorn.run(
         "main:app",  # replace 'main' with your filename
