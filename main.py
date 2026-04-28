@@ -8,6 +8,7 @@ import os
 import time
 from google import genai
 from groq import Groq
+import concurrent.futures  # Added for thread pool tuning
 
 app = FastAPI()
 
@@ -44,8 +45,7 @@ GEMINI_MODELS = [
     "models/gemini-2.5-flash-lite",
 ]
 
-# ── Trailing comma regex (compiled once at module level) ──────────────────
-# Matches a comma followed by optional whitespace then ] or }
+# ── Trailing comma regex ──────────────────────────────────────────────────
 TRAILING_COMMA_RE = re.compile(r",\s*(?=[}\]])")
 
 # ── Helper Functions ──────────────────────────────────────────────────────
@@ -97,13 +97,11 @@ def extract_json(raw: str) -> str:
         end = raw.rfind(end_char)
         if start != -1 and end != -1 and end > start:
             candidate = raw[start:end + 1]
-            # 1. Try as-is
             try:
                 json.loads(candidate)
                 return candidate
             except json.JSONDecodeError:
                 pass
-            # 2. Fix trailing commas — common Groq/Llama output issue
             cleaned = TRAILING_COMMA_RE.sub("", candidate)
             try:
                 json.loads(cleaned)
@@ -194,7 +192,6 @@ def call_gemini(prompt: str) -> str:
 
 # ── Primary: Groq first, Gemini fallback ─────────────────────────────────
 def call_ai_with_retry(prompt: str, retries: int = 3, delay: int = 2) -> str:
-    # 1. Try Groq first
     if GROQ_API_KEY:
         current_delay = delay
         for attempt in range(retries):
@@ -213,7 +210,6 @@ def call_ai_with_retry(prompt: str, retries: int = 3, delay: int = 2) -> str:
     else:
         print("GROQ_API_KEY not set, using Gemini...")
 
-    # 2. Fallback to Gemini
     current_delay = delay
     last_error = None
     for attempt in range(retries):
@@ -230,80 +226,6 @@ def call_ai_with_retry(prompt: str, retries: int = 3, delay: int = 2) -> str:
 
     raise last_error or Exception("Both Groq and Gemini exhausted all retries")
 
-# ── Queue System ──────────────────────────────────────────────────────────
-quiz_queue = asyncio.Queue()
-
-async def process_quiz_queue():
-    while True:
-        func, args, future = await quiz_queue.get()
-        try:
-            result = await asyncio.get_event_loop().run_in_executor(None, func, *args)
-            future.set_result(result)
-        except Exception as e:
-            future.set_exception(e)
-        finally:
-            quiz_queue.task_done()
-
-@app.on_event("startup")
-async def startup_event():
-    asyncio.create_task(process_quiz_queue())
-
-# ── FastAPI Endpoint ──────────────────────────────────────────────────────
-@app.post("/generate-quiz")
-async def generate_quiz(
-    file: UploadFile = File(...),
-    quiz_type: str = Form(...),
-    question_count: int = Form(...),
-):
-    try:
-        file_bytes = await file.read()
-        text = extract_text(file_bytes)
-        if not text.strip():
-            return {"error": "Could not extract text from PDF or PDF is empty."}
-
-        prompt = build_prompt(quiz_type, question_count, text)
-        if not prompt.strip():
-            return {"error": "Failed to build prompt. PDF may be unreadable or empty."}
-
-        position = quiz_queue.qsize() + 1
-        future = asyncio.get_event_loop().create_future()
-        await quiz_queue.put((call_ai_with_retry, [prompt], future))
-
-        raw = await future
-        if not raw or not raw.strip():
-            return {"error": "Quiz generation failed: empty response from AI."}
-
-        cleaned = extract_json(raw)
-        try:
-            quiz = json.loads(cleaned)
-            quiz = ensure_choices(quiz, quiz_type)
-        except json.JSONDecodeError as e:
-            print(f"JSON decode failed. Raw response:\n{raw}")
-            return {"error": f"Failed to parse quiz JSON: {str(e)}"}
-
-        print(f"Quiz ready, first item preview: {quiz[0] if quiz else 'Empty'}")
-        return {"quiz": quiz, "quiz_type": quiz_type, "position": position}
-
-    except Exception as e:
-        if any(code in str(e) for code in ["RESOURCE_EXHAUSTED", "429"]):
-            return {"error": "AI quota exceeded. Please try later or upgrade plan."}
-        print(f"Unexpected error in generate_quiz: {str(e)}")
-        return {"error": f"Unexpected error: {str(e)}"}
-
-# ── Health check ──────────────────────────────────────────────────────────
-@app.get("/")
-async def health():
-    groq_status = "configured" if GROQ_API_KEY else "not set"
-    gemini_keys = sum(1 for k in GEMINI_API_KEYS if k)
-    return {
-        "status":      "ok",
-        "groq":        groq_status,
-        "gemini_keys": f"{gemini_keys} configured",
-        "priority":    "Groq then Gemini"
-    }
-
-# ── Server start ──────────────────────────────────────────────────────────
-if __name__ == "__main__":
-    import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info", reload=False)
+# ── Queue System with Multi-Workers ──────────────────────────────────────
+NUM_WORKERS = 4  # Number of parallel workers
+quiz_queue = asyncio
