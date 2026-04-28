@@ -3,3 +3,4 @@ uvicorn
 pymupdf
 google-genai
 python-multipart
+groq
