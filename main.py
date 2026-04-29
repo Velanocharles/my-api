@@ -80,19 +80,20 @@ def build_prompt(quiz_type: str, question_count: int, text: str) -> str:
         )
 
     elif quiz_type == "identification":
-    format_instructions = (
-        f"Generate exactly {question_count} FILL IN THE BLANK questions.\n"
-        "Each question must be a sentence with exactly ONE blank represented by '___'.\n"
-        "The 'answer' field must be the single word or short term that fills the blank.\n"
-        "The blank should replace a KEY TERM, concept, or important word from the text.\n"
-        "Do NOT include a 'choices' field in any question.\n"
-        "Do NOT generate multiple choice or true/false questions.\n"
-        "Return ONLY a valid JSON array. No markdown, no explanation, no extra text.\n"
-        "Example format:\n"
-        '[{"question": "___ is the process by which plants convert sunlight into food.", "answer": "Photosynthesis"}, '
-        '{"question": "The mitochondria is known as the ___ of the cell.", "answer": "powerhouse"}, '
-        '{"question": "___ proposed the theory of relativity.", "answer": "Einstein"}]'
-    )
+        format_instructions = (
+            f"Generate exactly {question_count} FILL IN THE BLANK questions.\n"
+            "Each question must be a sentence with exactly ONE blank represented by '___'.\n"
+            "The 'answer' field must be the single word or short term that fills the blank.\n"
+            "The blank should replace a KEY TERM, concept, or important word from the text.\n"
+            "Do NOT include a 'choices' field in any question.\n"
+            "Do NOT generate multiple choice or true/false questions.\n"
+            "Return ONLY a valid JSON array. No markdown, no explanation, no extra text.\n"
+            "Example format:\n"
+            '[{"question": "___ is the process by which plants convert sunlight into food.", "answer": "Photosynthesis"}, '
+            '{"question": "The mitochondria is known as the ___ of the cell.", "answer": "powerhouse"}, '
+            '{"question": "___ proposed the theory of relativity.", "answer": "Einstein"}]'
+        )
+
     else:
         return ""
 
