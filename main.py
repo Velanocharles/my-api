@@ -55,27 +55,52 @@ def build_prompt(quiz_type: str, question_count: int, text: str) -> str:
     if not snippet.strip():
         return ""
 
-    base = (
-        f"You are a teacher creating a HOTS (Higher Order Thinking Skills) quiz.\n"
-        f"Return ONLY a valid JSON array with NO extra text, no markdown, no explanation.\n"
-        f"Generate exactly {question_count} questions from the text below.\n\n"
-    )
-
     if quiz_type == "multiple_choice":
         format_instructions = (
-            "Each question must include exactly 4 choices in a 'choices' array.\n"
-            "The correct answer must be in 'answer'.\n"
-            "Example:\n"
-            '[{"question": "Why does ice float?", "choices": ["It is heavy", "Density decreases", "Melting point", "Freezes quickly"], "answer": "Density decreases"}]'
+            f"Generate exactly {question_count} MULTIPLE CHOICE questions.\n"
+            "Each question MUST have exactly 4 choices in a 'choices' array.\n"
+            "The correct answer must appear in the 'choices' array and also in 'answer'.\n"
+            "Do NOT generate true/false or identification questions.\n"
+            "Return ONLY a valid JSON array. No markdown, no explanation, no extra text.\n"
+            "Example format:\n"
+            '[{"question": "Why does ice float on water?", "choices": ["It is lighter than water", "Density of ice is less than water", "Ice has no mass", "Water repels ice"], "answer": "Density of ice is less than water"}]'
         )
+
     elif quiz_type == "true_or_false":
-        format_instructions = '[{"question": "Water boils at 100°C.", "answer": "True"}]'
+        format_instructions = (
+            f"Generate exactly {question_count} TRUE OR FALSE questions.\n"
+            "Each question must be a statement that is either True or False.\n"
+            "The 'answer' field must be ONLY the word 'True' or 'False'.\n"
+            "Do NOT include a 'choices' field in any question.\n"
+            "Do NOT generate multiple choice or identification questions.\n"
+            "Return ONLY a valid JSON array. No markdown, no explanation, no extra text.\n"
+            "Example format:\n"
+            '[{"question": "Water boils at 100 degrees Celsius at sea level.", "answer": "True"}, '
+            '{"question": "The sun revolves around the Earth.", "answer": "False"}]'
+        )
+
     elif quiz_type == "identification":
-        format_instructions = '[{"question": "Process plants use to convert sunlight to food?", "answer": "Photosynthesis"}]'
+    format_instructions = (
+        f"Generate exactly {question_count} FILL IN THE BLANK questions.\n"
+        "Each question must be a sentence with exactly ONE blank represented by '___'.\n"
+        "The 'answer' field must be the single word or short term that fills the blank.\n"
+        "The blank should replace a KEY TERM, concept, or important word from the text.\n"
+        "Do NOT include a 'choices' field in any question.\n"
+        "Do NOT generate multiple choice or true/false questions.\n"
+        "Return ONLY a valid JSON array. No markdown, no explanation, no extra text.\n"
+        "Example format:\n"
+        '[{"question": "___ is the process by which plants convert sunlight into food.", "answer": "Photosynthesis"}, '
+        '{"question": "The mitochondria is known as the ___ of the cell.", "answer": "powerhouse"}, '
+        '{"question": "___ proposed the theory of relativity.", "answer": "Einstein"}]'
+    )
     else:
         return ""
 
-    return f"{base}{format_instructions}\n\nText:\n{snippet}"
+    return (
+        f"You are a teacher creating a HOTS (Higher Order Thinking Skills) quiz.\n"
+        f"{format_instructions}\n\n"
+        f"Text to base questions on:\n{snippet}"
+    )
 
 def extract_json(raw: str) -> str:
     raw = raw.strip().replace("```json", "").replace("```", "").strip()
