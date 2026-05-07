@@ -115,14 +115,18 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
     if not text_snippet:
         return ""
 
+    # Determine HOTS vs Normal split
+    hot_count = question_count // 2
+    normal_count = question_count - hot_count
+
     quality_rules = (
-        "STRICT RULES:\n"
-        f"- You MUST generate EXACTLY {question_count} questions — no more, no less.\n"
-        "- Every question must test a DIFFERENT concept or fact from the text.\n"
-        "- Do NOT repeat similar questions or paraphrase the same idea twice.\n"
-        "- Questions must be non-trivial: the answer must NOT be obvious just from reading the question.\n"
-        "- Base EVERY question strictly on the provided text — do not invent facts.\n"
-        "- Vary your question structures (don't start every question the same way).\n"
+        f"STRICT RULES:\n"
+        f"- Generate EXACTLY {question_count} questions for this chunk.\n"
+        f"- {hot_count} questions must be HOTS (Higher Order Thinking Skills) requiring reasoning, analysis, evaluation, or synthesis.\n"
+        f"- {normal_count} questions can be normal factual/recall questions.\n"
+        "- Avoid repeating the same idea or question.\n"
+        "- Questions must be based strictly on the provided text; do NOT invent facts.\n"
+        "- Vary your question structures; do NOT start all questions the same way.\n"
     )
 
     if quiz_type == "multiple_choice":
@@ -130,23 +134,17 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
             f"Generate EXACTLY {question_count} multiple choice questions.\n"
             + quality_rules +
             "For each question:\n"
-            "  - Write a specific question about a key concept.\n"
-            "  - Provide EXACTLY 4 answer choices.\n"
-            "  - The 3 WRONG choices must be PLAUSIBLE and closely related to the topic — not obviously wrong.\n"
-            "  - The correct answer must appear word-for-word inside the choices array.\n"
-            "  - Randomise which position (index 0-3) the correct answer appears at.\n\n"
-            "Return ONLY a valid JSON array, no markdown, no extra text:\n"
+            "  - Provide exactly 4 choices for every question.\n"
+            "  - The correct answer must be in the choices array.\n"
+            "  - For HOTS questions, design plausible distractors that require thinking.\n"
+            "  - For normal questions, distractors can be factual but not obvious.\n\n"
+            "Return ONLY a valid JSON array, no markdown or extra text:\n"
             '[{"question": "...", "choices": ["...", "...", "...", "..."], "answer": "..."}, ...]'
         )
     elif quiz_type == "true_or_false":
         fmt = (
-            f"Generate EXACTLY {question_count} true or false questions.\n"
+            f"Generate EXACTLY {question_count} true/false questions.\n"
             + quality_rules +
-            "For each question:\n"
-            "  - Write a clear declarative statement.\n"
-            "  - Mix True and False answers roughly 50/50.\n"
-            "  - False statements must contain a specific incorrect detail — not just be vague.\n"
-            "  - The 'answer' field must be exactly the string 'True' or 'False'.\n\n"
             "Return ONLY a valid JSON array, no markdown:\n"
             '[{"question": "...", "answer": "True"}, ...]'
         )
@@ -154,12 +152,8 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
         fmt = (
             f"Generate EXACTLY {question_count} fill-in-the-blank questions.\n"
             + quality_rules +
-            "For each question:\n"
-            "  - Replace a key term, name, date, or concept with a blank (use underscores: _____).\n"
-            "  - The blank must be identifiable from context but not trivially obvious.\n"
-            "  - The 'answer' field must be a concise word or short phrase, not a full sentence.\n\n"
             "Return ONLY a valid JSON array, no markdown:\n"
-            '[{"question": "_____ is defined as ...", "answer": "..."}, ...]'
+            '[{"question": "_____ is ...", "answer": "..."}, ...]'
         )
     else:
         return ""
