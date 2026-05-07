@@ -4,12 +4,15 @@ import fitz
 import json
 import re
 import os
-import time
-import math
 import asyncio
 import gc
+import math
+import logging
 from google import genai
 from groq import Groq
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -22,10 +25,12 @@ app.add_middleware(
 
 # ── Config ────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+
+# 8B model first — 14,400 RPD vs 1,000 RPD for 70B
+# quality difference is minimal for structured JSON quiz generation
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama3-70b-8192",
     "llama3-8b-8192",
+    "llama-3.3-70b-versatile",
     "mixtral-8x7b-32768",
 ]
 
@@ -38,17 +43,42 @@ GEMINI_API_KEYS = [k for k in [
     os.getenv("GOOGLE_API_KEY_6"),
 ] if k]
 
+# Flash-Lite first — fastest + highest RPD (1,500/day)
+# Drop Pro entirely — overkill for quiz generation
 GEMINI_MODELS = [
     "models/gemini-2.5-flash-lite",
     "models/gemini-2.5-flash",
-    "models/gemini-2.5-pro",
 ]
 
 TRAILING_COMMA_RE = re.compile(r",\s*(?=[}\]])")
 
-MAX_CHUNK_SIZE     = 1500
-CHUNK_OVERLAP      = 100
-MAX_CHUNKS_PER_PDF = 10
+# Doubled chunk size + halved chunk count = same coverage, 5 API calls instead of 10
+MAX_CHUNK_SIZE     = 3000   # was 1500
+CHUNK_OVERLAP      = 150    # slightly more overlap for bigger chunks
+MAX_CHUNKS_PER_PDF = 5      # was 10
+
+# 3 concurrent calls — balanced between speed and rate limit safety
+AI_SEMAPHORE = asyncio.Semaphore(3)
+
+# ── In-memory quiz cache ──────────────────────────────────────────────────
+# Key: md5(pdf_bytes) + quiz_type + question_count
+# Value: generated quiz list
+_quiz_cache: dict[str, list] = {}
+_CACHE_MAX_SIZE = 200  # evict oldest when full
+
+def get_cache_key(file_bytes: bytes, quiz_type: str, question_count: int) -> str:
+    pdf_hash = hashlib.md5(file_bytes).hexdigest()
+    return f"{pdf_hash}_{quiz_type}_{question_count}"
+
+def cache_get(key: str) -> list | None:
+    return _quiz_cache.get(key)
+
+def cache_set(key: str, quiz: list) -> None:
+    if len(_quiz_cache) >= _CACHE_MAX_SIZE:
+        # evict the oldest entry
+        oldest = next(iter(_quiz_cache))
+        del _quiz_cache[oldest]
+    _quiz_cache[key] = quiz
 
 # ── Singleton AI clients ──────────────────────────────────────────────────
 _groq_client: Groq | None = None
@@ -64,8 +94,6 @@ def get_gemini_client(api_key: str) -> genai.Client:
     if api_key not in _gemini_clients:
         _gemini_clients[api_key] = genai.Client(api_key=api_key)
     return _gemini_clients[api_key]
-
-AI_SEMAPHORE = asyncio.Semaphore(1)
 
 
 # ── Text Extraction ───────────────────────────────────────────────────────
@@ -115,8 +143,7 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
     if not text_snippet:
         return ""
 
-    # Split questions: 50% HOTS, 50% concept-based
-    hot_count = question_count // 2
+    hot_count    = question_count // 2
     normal_count = question_count - hot_count
 
     quality_rules = (
@@ -207,7 +234,6 @@ def ensure_choices(quiz: list, quiz_type: str) -> list:
         answer  = q.get("answer", "")
         if not choices or len(choices) < 4:
             continue
-        # Drop questions where the AI returned placeholder choices
         if any(c.lower().startswith("option") for c in choices):
             continue
         if not answer or answer not in choices:
@@ -258,26 +284,58 @@ def call_gemini(prompt: str) -> str:
     raise last_error or Exception("All Gemini keys and models exhausted")
 
 
-def call_ai_with_retry(prompt: str, retries: int = 2, delay: int = 2) -> str:
-    if GROQ_API_KEY:
+def _is_rate_limit_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return any(kw in msg for kw in ("rate limit", "429", "quota", "too many"))
+
+
+async def call_ai_with_retry(prompt: str, retries: int = 2) -> str:
+    async def try_provider(fn):
+        last_err = None
         for attempt in range(retries):
             try:
-                return call_groq(prompt)
-            except Exception:
-                if attempt < retries - 1:
-                    time.sleep(delay * (attempt + 1))
-    for attempt in range(retries):
+                return await asyncio.to_thread(fn, prompt)
+            except Exception as e:
+                last_err = e
+                if _is_rate_limit_error(e) and attempt < retries - 1:
+                    await asyncio.sleep(2 ** attempt)
+                else:
+                    break
+        raise last_err
+
+    if GROQ_API_KEY:
         try:
-            return call_gemini(prompt)
+            return await try_provider(call_groq)
         except Exception:
-            if attempt < retries - 1:
-                time.sleep(delay * (attempt + 1))
-    raise Exception("Both Groq and Gemini exhausted all retries")
+            pass
+
+    return await try_provider(call_gemini)
 
 
 async def call_ai_with_semaphore(prompt: str) -> str:
     async with AI_SEMAPHORE:
-        return await asyncio.to_thread(call_ai_with_retry, prompt)
+        return await call_ai_with_retry(prompt)
+
+
+# ── Per-chunk processor ───────────────────────────────────────────────────
+async def process_chunk(
+    idx: int,
+    chunk: str,
+    q_count: int,
+    quiz_type: str,
+    total_chunks: int,
+) -> list:
+    prompt = build_prompt(quiz_type, q_count, chunk, idx, total_chunks)
+    if not prompt.strip():
+        return []
+    try:
+        raw     = await call_ai_with_semaphore(prompt)
+        cleaned = extract_json(raw)
+        quiz    = json.loads(cleaned)
+        return ensure_choices(quiz, quiz_type)
+    except Exception as e:
+        logger.warning("Chunk %d failed: %s", idx, e)
+        return []
 
 
 # ── Core Quiz Generator ───────────────────────────────────────────────────
@@ -286,47 +344,33 @@ async def generate_quiz_from_text(text: str, quiz_type: str, question_count: int
     del text
     gc.collect()
 
-    total_chunks   = len(chunks)
-    base_count     = question_count // total_chunks
-    remainder      = question_count % total_chunks
-    q_per_chunk    = [base_count + (1 if i < remainder else 0) for i in range(total_chunks)]
+    total_chunks = len(chunks)
+    base_count   = question_count // total_chunks
+    remainder    = question_count % total_chunks
+    q_per_chunk  = [base_count + (1 if i < remainder else 0) for i in range(total_chunks)]
 
-    all_questions: list     = []
-    seen_questions: set[str] = set()
-
-    for idx, chunk in enumerate(chunks):
-        q_count = q_per_chunk[idx]
-        if q_count == 0:
-            continue
-
-        prompt = build_prompt(quiz_type, q_count, chunk, idx, total_chunks)
-        if not prompt.strip():
-            continue
-
-        try:
-            raw     = await call_ai_with_semaphore(prompt)
-            cleaned = extract_json(raw)
-            quiz    = json.loads(cleaned)
-            quiz    = ensure_choices(quiz, quiz_type)
-
-            for q in quiz:
-                q_text = q.get("question", "").strip().lower()
-                if q_text and q_text not in seen_questions:
-                    seen_questions.add(q_text)
-                    all_questions.append(q)
-
-        except Exception:
-            pass
-        finally:
-            del prompt, chunk
-            gc.collect()
-
+    tasks = [
+        process_chunk(i, chunk, q_per_chunk[i], quiz_type, total_chunks)
+        for i, chunk in enumerate(chunks)
+        if q_per_chunk[i] > 0
+    ]
     del chunks
-
-    result = all_questions[:question_count]
-    del all_questions, seen_questions
     gc.collect()
-    return result
+
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    seen: set[str] = set()
+    all_questions: list = []
+    for result in results:
+        if isinstance(result, Exception):
+            continue
+        for q in result:
+            q_text = q.get("question", "").strip().lower()
+            if q_text and q_text not in seen:
+                seen.add(q_text)
+                all_questions.append(q)
+
+    return all_questions[:question_count]
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
@@ -337,6 +381,20 @@ async def generate_quiz(
     question_count: int = Form(...),
 ):
     file_bytes = await file.read()
+
+    # Check cache first — free and instant
+    cache_key = get_cache_key(file_bytes, quiz_type, question_count)
+    cached = cache_get(cache_key)
+    if cached is not None:
+        logger.info("Cache hit for %s", file.filename)
+        return {
+            "quiz": cached,
+            "quiz_type": quiz_type,
+            "total_questions": len(cached),
+            "requested": question_count,
+            "cached": True,
+        }
+
     text = extract_text_lean(file_bytes)
     del file_bytes
     gc.collect()
@@ -348,11 +406,15 @@ async def generate_quiz(
     del text
     gc.collect()
 
+    # Save to cache for next time
+    cache_set(cache_key, quiz)
+
     return {
         "quiz": quiz,
         "quiz_type": quiz_type,
         "total_questions": len(quiz),
         "requested": question_count,
+        "cached": False,
     }
 
 
@@ -362,38 +424,68 @@ async def generate_quiz_multiple(
     quiz_type: str = Form(...),
     question_count: int = Form(...),
 ):
-    results = []
-
-    for file in files:
+    async def handle_file(file: UploadFile) -> dict:
         file_bytes = await file.read()
+
+        # Check cache first
+        cache_key = get_cache_key(file_bytes, quiz_type, question_count)
+        cached = cache_get(cache_key)
+        if cached is not None:
+            logger.info("Cache hit for %s", file.filename)
+            return {
+                "file_name": file.filename,
+                "quiz_type": quiz_type,
+                "total_questions": len(cached),
+                "requested": question_count,
+                "cached": True,
+                "quiz": cached,
+            }
+
         text = extract_text_lean(file_bytes)
         del file_bytes
         gc.collect()
 
         if not text.strip():
-            results.append({
+            return {
                 "file_name": file.filename,
                 "error": "Could not extract text from PDF or PDF is empty.",
                 "quiz": [],
-            })
-            del text
-            continue
+            }
 
         quiz = await generate_quiz_from_text(text, quiz_type, question_count)
         del text
         gc.collect()
 
-        results.append({
+        cache_set(cache_key, quiz)
+
+        return {
             "file_name": file.filename,
             "quiz_type": quiz_type,
             "total_questions": len(quiz),
             "requested": question_count,
+            "cached": False,
             "quiz": quiz,
-        })
-        del quiz
-        gc.collect()
+        }
 
-    return {"results": results}
+    results = await asyncio.gather(*[handle_file(f) for f in files], return_exceptions=True)
+
+    clean = []
+    for i, r in enumerate(results):
+        if isinstance(r, Exception):
+            clean.append({"file_name": files[i].filename, "error": str(r), "quiz": []})
+        else:
+            clean.append(r)
+
+    return {"results": clean}
+
+
+@app.get("/cache-stats")
+async def cache_stats():
+    """Quick endpoint to see how well caching is working."""
+    return {
+        "cached_quizzes": len(_quiz_cache),
+        "cache_limit": _CACHE_MAX_SIZE,
+    }
 
 
 @app.get("/")
@@ -402,7 +494,8 @@ async def health():
         "status": "ok",
         "groq": "configured" if GROQ_API_KEY else "not set",
         "gemini_keys": f"{len(GEMINI_API_KEYS)} configured",
-        "priority": "Groq then Gemini",
+        "priority": "Groq (8B first) then Gemini (Flash-Lite first)",
+        "cached_quizzes": len(_quiz_cache),
     }
 
 
