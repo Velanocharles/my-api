@@ -27,7 +27,6 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # 8B model first — 14,400 RPD vs 1,000 RPD for 70B
-# quality difference is minimal for structured JSON quiz generation
 GROQ_MODELS = [
     "llama3-8b-8192",
     "llama-3.3-70b-versatile",
@@ -44,7 +43,6 @@ GEMINI_API_KEYS = [k for k in [
 ] if k]
 
 # Flash-Lite first — fastest + highest RPD (1,500/day)
-# Drop Pro entirely — overkill for quiz generation
 GEMINI_MODELS = [
     "models/gemini-2.5-flash-lite",
     "models/gemini-2.5-flash",
@@ -52,33 +50,12 @@ GEMINI_MODELS = [
 
 TRAILING_COMMA_RE = re.compile(r",\s*(?=[}\]])")
 
-# Doubled chunk size + halved chunk count = same coverage, 5 API calls instead of 10
-MAX_CHUNK_SIZE     = 3000   # was 1500
-CHUNK_OVERLAP      = 150    # slightly more overlap for bigger chunks
-MAX_CHUNKS_PER_PDF = 5      # was 10
+MAX_CHUNK_SIZE     = 3000
+CHUNK_OVERLAP      = 150
+MAX_CHUNKS_PER_PDF = 5
 
 # 3 concurrent calls — balanced between speed and rate limit safety
 AI_SEMAPHORE = asyncio.Semaphore(3)
-
-# ── In-memory quiz cache ──────────────────────────────────────────────────
-# Key: md5(pdf_bytes) + quiz_type + question_count
-# Value: generated quiz list
-_quiz_cache: dict[str, list] = {}
-_CACHE_MAX_SIZE = 200  # evict oldest when full
-
-def get_cache_key(file_bytes: bytes, quiz_type: str, question_count: int) -> str:
-    pdf_hash = hashlib.md5(file_bytes).hexdigest()
-    return f"{pdf_hash}_{quiz_type}_{question_count}"
-
-def cache_get(key: str) -> list | None:
-    return _quiz_cache.get(key)
-
-def cache_set(key: str, quiz: list) -> None:
-    if len(_quiz_cache) >= _CACHE_MAX_SIZE:
-        # evict the oldest entry
-        oldest = next(iter(_quiz_cache))
-        del _quiz_cache[oldest]
-    _quiz_cache[key] = quiz
 
 # ── Singleton AI clients ──────────────────────────────────────────────────
 _groq_client: Groq | None = None
@@ -381,20 +358,6 @@ async def generate_quiz(
     question_count: int = Form(...),
 ):
     file_bytes = await file.read()
-
-    # Check cache first — free and instant
-    cache_key = get_cache_key(file_bytes, quiz_type, question_count)
-    cached = cache_get(cache_key)
-    if cached is not None:
-        logger.info("Cache hit for %s", file.filename)
-        return {
-            "quiz": cached,
-            "quiz_type": quiz_type,
-            "total_questions": len(cached),
-            "requested": question_count,
-            "cached": True,
-        }
-
     text = extract_text_lean(file_bytes)
     del file_bytes
     gc.collect()
@@ -406,15 +369,11 @@ async def generate_quiz(
     del text
     gc.collect()
 
-    # Save to cache for next time
-    cache_set(cache_key, quiz)
-
     return {
         "quiz": quiz,
         "quiz_type": quiz_type,
         "total_questions": len(quiz),
         "requested": question_count,
-        "cached": False,
     }
 
 
@@ -426,21 +385,6 @@ async def generate_quiz_multiple(
 ):
     async def handle_file(file: UploadFile) -> dict:
         file_bytes = await file.read()
-
-        # Check cache first
-        cache_key = get_cache_key(file_bytes, quiz_type, question_count)
-        cached = cache_get(cache_key)
-        if cached is not None:
-            logger.info("Cache hit for %s", file.filename)
-            return {
-                "file_name": file.filename,
-                "quiz_type": quiz_type,
-                "total_questions": len(cached),
-                "requested": question_count,
-                "cached": True,
-                "quiz": cached,
-            }
-
         text = extract_text_lean(file_bytes)
         del file_bytes
         gc.collect()
@@ -456,14 +400,11 @@ async def generate_quiz_multiple(
         del text
         gc.collect()
 
-        cache_set(cache_key, quiz)
-
         return {
             "file_name": file.filename,
             "quiz_type": quiz_type,
             "total_questions": len(quiz),
             "requested": question_count,
-            "cached": False,
             "quiz": quiz,
         }
 
@@ -479,15 +420,6 @@ async def generate_quiz_multiple(
     return {"results": clean}
 
 
-@app.get("/cache-stats")
-async def cache_stats():
-    """Quick endpoint to see how well caching is working."""
-    return {
-        "cached_quizzes": len(_quiz_cache),
-        "cache_limit": _CACHE_MAX_SIZE,
-    }
-
-
 @app.get("/")
 async def health():
     return {
@@ -495,7 +427,6 @@ async def health():
         "groq": "configured" if GROQ_API_KEY else "not set",
         "gemini_keys": f"{len(GEMINI_API_KEYS)} configured",
         "priority": "Groq (8B first) then Gemini (Flash-Lite first)",
-        "cached_quizzes": len(_quiz_cache),
     }
 
 
