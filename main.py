@@ -113,6 +113,22 @@ def chunk_text(text: str) -> list[str]:
     return chunks
 
 
+# ── Similarity Check ──────────────────────────────────────────────────────
+def is_too_similar(new_q: str, seen_questions: set[str], threshold: float = 0.7) -> bool:
+    """Returns True if new_q overlaps 70%+ with any already-seen question."""
+    new_words = set(new_q.lower().split())
+    if not new_words:
+        return False
+    for seen_q in seen_questions:
+        seen_words = set(seen_q.lower().split())
+        if not seen_words:
+            continue
+        overlap = len(new_words & seen_words) / max(len(new_words), len(seen_words))
+        if overlap >= threshold:
+            return True
+    return False
+
+
 # ── Prompt Builder ────────────────────────────────────────────────────────
 def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
                  chunk_index: int, total_chunks: int) -> str:
@@ -130,6 +146,7 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
         f"- {normal_count} questions should be concept-based, testing definitions or key ideas from the text.\n"
         "- Avoid trivial details like titles, dates, or formatting.\n"
         "- Do NOT repeat similar questions.\n"
+        "- Each question must test a DIFFERENT concept. No two questions should be about the same topic.\n"
         "- Each question should be clear, unambiguous, and based strictly on the provided text.\n"
         "- Vary question structures for engagement.\n"
     )
@@ -343,7 +360,7 @@ async def generate_quiz_from_text(text: str, quiz_type: str, question_count: int
             continue
         for q in result:
             q_text = q.get("question", "").strip().lower()
-            if q_text and q_text not in seen:
+            if q_text and not is_too_similar(q_text, seen):
                 seen.add(q_text)
                 all_questions.append(q)
 
