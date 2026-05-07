@@ -6,9 +6,9 @@ import re
 import asyncio
 import os
 import time
+import math
 from google import genai
 from groq import Groq
-import concurrent.futures
 
 app = FastAPI()
 
@@ -50,62 +50,73 @@ def extract_text(file_bytes: bytes) -> str:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     return "".join(page.get_text() for page in doc)
 
-def build_prompt(quiz_type: str, question_count: int, text: str) -> str:
-    snippet = text[:8000]
-    if not snippet.strip():
+
+def chunk_text(text: str, max_chunk_size: int = 3000, overlap: int = 500, max_chunks: int = 10) -> list[str]:
+    """
+    Split text into overlapping chunks for full coverage.
+    Dynamically adjusts chunk size to limit number of chunks to max_chunks.
+    """
+    text_length = len(text)
+    if text_length <= max_chunk_size:
+        return [text]
+
+    # Adjust chunk_size if text is too long
+    chunk_size = max_chunk_size
+    if text_length / chunk_size > max_chunks:
+        chunk_size = math.ceil(text_length / max_chunks)
+
+    chunks = []
+    start = 0
+    while start < text_length:
+        end = min(start + chunk_size, text_length)
+        chunks.append(text[start:end])
+        start = end - overlap
+        if start < 0:
+            start = 0
+    return chunks
+
+
+def build_prompt(quiz_type: str, question_count: int, text_chunk: str, chunk_index: int, total_chunks: int) -> str:
+    text_snippet = text_chunk.strip()
+    if not text_snippet:
         return ""
 
     if quiz_type == "multiple_choice":
         format_instructions = (
             f"Generate exactly {question_count} MULTIPLE CHOICE questions.\n"
+            "Each question must focus on a different concept or fact from this chunk.\n"
             "Each question MUST have exactly 4 choices in a 'choices' array.\n"
             "The correct answer must appear in the 'choices' array and also in 'answer'.\n"
-            "Do NOT generate true/false or identification questions.\n"
-            "Return ONLY a valid JSON array. No markdown, no explanation, no extra text.\n"
-            "Example format:\n"
-            '[{"question": "Why does ice float on water?", "choices": ["It is lighter than water", "Density of ice is less than water", "Ice has no mass", "Water repels ice"], "answer": "Density of ice is less than water"}]'
+            "Return ONLY a valid JSON array. No markdown, no explanation, no extra text."
         )
-
     elif quiz_type == "true_or_false":
         format_instructions = (
             f"Generate exactly {question_count} TRUE OR FALSE questions.\n"
-            "Each question must be a statement that is either True or False.\n"
-            "The 'answer' field must be ONLY the word 'True' or 'False'.\n"
-            "Do NOT include a 'choices' field in any question.\n"
-            "Do NOT generate multiple choice or identification questions.\n"
-            "Return ONLY a valid JSON array. No markdown, no explanation, no extra text.\n"
-            "Example format:\n"
-            '[{"question": "Water boils at 100 degrees Celsius at sea level.", "answer": "True"}, '
-            '{"question": "The sun revolves around the Earth.", "answer": "False"}]'
+            "Each statement must focus on a different concept or fact from this chunk.\n"
+            "The 'answer' field must be ONLY 'True' or 'False'.\n"
+            "Do NOT include a 'choices' field.\n"
+            "Return ONLY a valid JSON array. No markdown, no explanation, no extra text."
         )
-
     elif quiz_type == "identification":
         format_instructions = (
             f"Generate exactly {question_count} FILL IN THE BLANK questions.\n"
-            "Each question must be a sentence with exactly ONE blank represented by '___'.\n"
-            "The 'answer' field must be the single word or short term that fills the blank.\n"
-            "The blank should replace a KEY TERM, concept, or important word from the text.\n"
-            "Do NOT include a 'choices' field in any question.\n"
-            "Do NOT generate multiple choice or true/false questions.\n"
-            "Return ONLY a valid JSON array. No markdown, no explanation, no extra text.\n"
-            "Example format:\n"
-            '[{"question": "___ is the process by which plants convert sunlight into food.", "answer": "Photosynthesis"}, '
-            '{"question": "The mitochondria is known as the ___ of the cell.", "answer": "powerhouse"}, '
-            '{"question": "___ proposed the theory of relativity.", "answer": "Einstein"}]'
+            "Each question must focus on a different concept or term from this chunk.\n"
+            "Return ONLY a valid JSON array. No markdown, no explanation, no extra text."
         )
-
     else:
         return ""
 
     return (
         f"You are a teacher creating a HOTS (Higher Order Thinking Skills) quiz.\n"
+        f"Chunk {chunk_index + 1} of {total_chunks}\n"
         f"{format_instructions}\n\n"
-        f"Text to base questions on:\n{snippet}"
+        f"Text to base questions on:\n{text_snippet}"
     )
+
 
 def extract_json(raw: str) -> str:
     raw = raw.strip().replace("```json", "").replace("```", "").strip()
-    for start_char, end_char in [("[", "]"), ("{", "}")]:
+    for start_char, end_char in [("[", "]"), ("{", "}")] :
         start = raw.find(start_char)
         end = raw.rfind(end_char)
         if start != -1 and end != -1 and end > start:
@@ -124,6 +135,7 @@ def extract_json(raw: str) -> str:
                 continue
     return raw
 
+
 def ensure_choices(quiz: list, quiz_type: str) -> list:
     if quiz_type != "multiple_choice":
         return quiz
@@ -133,6 +145,7 @@ def ensure_choices(quiz: list, quiz_type: str) -> list:
         if "answer" not in q or not q["answer"]:
             q["answer"] = q["choices"][0]
     return quiz
+
 
 # ── Groq & Gemini API Calls ────────────────────────────────────────────────
 def call_groq(prompt: str) -> str:
@@ -165,6 +178,7 @@ def call_groq(prompt: str) -> str:
                 raise
     raise last_error or Exception("All Groq models exhausted")
 
+
 def call_gemini(prompt: str) -> str:
     last_error = None
     for api_key in GEMINI_API_KEYS:
@@ -182,6 +196,7 @@ def call_gemini(prompt: str) -> str:
                 else:
                     raise
     raise last_error or Exception("All Gemini API keys and models exhausted")
+
 
 def call_ai_with_retry(prompt: str, retries: int = 3, delay: int = 2) -> str:
     if GROQ_API_KEY:
@@ -209,9 +224,12 @@ def call_ai_with_retry(prompt: str, retries: int = 3, delay: int = 2) -> str:
                 raise
     raise last_error or Exception("Both Groq and Gemini exhausted all retries")
 
+
 # ── Multi-Worker Async Queue ──────────────────────────────────────────────
 NUM_WORKERS = 4
-quiz_queue = asyncio.Queue(maxsize=50)
+MAX_QUEUE_SIZE = 50
+quiz_queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+
 
 async def process_quiz_worker(worker_id: int):
     loop = asyncio.get_running_loop()
@@ -225,6 +243,7 @@ async def process_quiz_worker(worker_id: int):
         finally:
             quiz_queue.task_done()
 
+
 @app.on_event("startup")
 async def startup_event():
     loop = asyncio.get_running_loop()
@@ -232,33 +251,70 @@ async def startup_event():
         loop.create_task(process_quiz_worker(i))
     print(f"Started {NUM_WORKERS} quiz workers")
 
-# ── FastAPI Endpoint ──────────────────────────────────────────────────────
+
+# ── Generate Quiz from PDF ────────────────────────────────────────────────
+async def generate_quiz_from_pdf(text: str, quiz_type: str, question_count: int) -> list:
+    chunks = chunk_text(text)
+    total_chunks = len(chunks)
+    all_questions = []
+
+    # Allocate questions per chunk
+    base_count = question_count // total_chunks
+    remainder = question_count % total_chunks
+    questions_per_chunk = [base_count] * total_chunks
+    for i in range(remainder):
+        questions_per_chunk[i] += 1
+
+    for idx, chunk in enumerate(chunks):
+        q_count = questions_per_chunk[idx]
+        if q_count == 0:
+            continue
+        prompt = build_prompt(quiz_type, q_count, chunk, idx, total_chunks)
+        if not prompt.strip():
+            continue
+        future = asyncio.get_running_loop().create_future()
+        await quiz_queue.put((call_ai_with_retry, [prompt], future))
+        raw = await future
+        cleaned = extract_json(raw)
+        try:
+            quiz = json.loads(cleaned)
+            quiz = ensure_choices(quiz, quiz_type)
+            all_questions.extend(quiz)
+        except json.JSONDecodeError:
+            continue
+
+    # Remove duplicates and trim to requested question_count
+    seen = set()
+    unique_questions = []
+    for q in all_questions:
+        q_text = q.get("question", "")
+        if q_text not in seen:
+            seen.add(q_text)
+            unique_questions.append(q)
+        if len(unique_questions) >= question_count:
+            break
+
+    return unique_questions
+
+
+# ── FastAPI Endpoint ─────────────────────────────────────────────────────
 @app.post("/generate-quiz")
 async def generate_quiz(
     file: UploadFile = File(...),
     quiz_type: str = Form(...),
-    question_count: int = Form(...),
+    question_count: int = Form(...)
 ):
+    if quiz_queue.qsize() >= MAX_QUEUE_SIZE:
+        return {"error": "Server is busy, please try again later."}
+
     file_bytes = await file.read()
     text = extract_text(file_bytes)
     if not text.strip():
         return {"error": "Could not extract text from PDF or PDF is empty."}
 
-    prompt = build_prompt(quiz_type, question_count, text)
-    if not prompt.strip():
-        return {"error": "Failed to build prompt. PDF may be unreadable or empty."}
+    quiz = await generate_quiz_from_pdf(text, quiz_type, question_count)
+    return {"quiz": quiz, "quiz_type": quiz_type, "total_questions": len(quiz)}
 
-    future = asyncio.get_running_loop().create_future()
-    await quiz_queue.put((call_ai_with_retry, [prompt], future))
-    raw = await future
-    cleaned = extract_json(raw)
-    try:
-        quiz = json.loads(cleaned)
-        quiz = ensure_choices(quiz, quiz_type)
-    except json.JSONDecodeError as e:
-        return {"error": f"Failed to parse quiz JSON: {str(e)}"}
-
-    return {"quiz": quiz, "quiz_type": quiz_type, "position": quiz_queue.qsize() + 1}
 
 # ── Health Check ─────────────────────────────────────────────────────────
 @app.get("/")
@@ -271,6 +327,7 @@ async def health():
         "gemini_keys": f"{gemini_keys} configured",
         "priority": "Groq then Gemini"
     }
+
 
 # ── Run Server ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
