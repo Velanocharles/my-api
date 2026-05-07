@@ -115,29 +115,31 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
     if not text_snippet:
         return ""
 
-    # Determine HOTS vs Normal split
+    # Split questions: 50% HOTS, 50% concept-based
     hot_count = question_count // 2
     normal_count = question_count - hot_count
 
     quality_rules = (
         f"STRICT RULES:\n"
-        f"- Generate EXACTLY {question_count} questions for this chunk.\n"
-        f"- {hot_count} questions must be HOTS (Higher Order Thinking Skills) requiring reasoning, analysis, evaluation, or synthesis.\n"
-        f"- {normal_count} questions can be normal factual/recall questions.\n"
-        "- Avoid repeating the same idea or question.\n"
-        "- Questions must be based strictly on the provided text; do NOT invent facts.\n"
-        "- Vary your question structures; do NOT start all questions the same way.\n"
+        f"- Generate EXACTLY {question_count} questions.\n"
+        f"- {hot_count} questions should be HOTS (Higher Order Thinking Skills) requiring analysis, evaluation, or application.\n"
+        f"- {normal_count} questions should be concept-based, testing definitions or key ideas from the text.\n"
+        "- Avoid trivial details like titles, dates, or formatting.\n"
+        "- Do NOT repeat similar questions.\n"
+        "- Each question should be clear, unambiguous, and based strictly on the provided text.\n"
+        "- Vary question structures for engagement.\n"
     )
 
     if quiz_type == "multiple_choice":
         fmt = (
             f"Generate EXACTLY {question_count} multiple choice questions.\n"
             + quality_rules +
-            "For each question:\n"
-            "  - Provide exactly 4 choices for every question.\n"
-            "  - The correct answer must be in the choices array.\n"
-            "  - For HOTS questions, design plausible distractors that require thinking.\n"
-            "  - For normal questions, distractors can be factual but not obvious.\n\n"
+            "For normal questions:\n"
+            "  - Focus on definitions, key terms, and core concepts.\n"
+            "  - Provide EXACTLY 4 answer choices.\n"
+            "  - The 3 incorrect choices should be plausible alternatives (conceptually related).\n"
+            "For HOTS questions:\n"
+            "  - Make questions that require reasoning, analysis, or application.\n"
             "Return ONLY a valid JSON array, no markdown or extra text:\n"
             '[{"question": "...", "choices": ["...", "...", "...", "..."], "answer": "..."}, ...]'
         )
@@ -145,15 +147,24 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
         fmt = (
             f"Generate EXACTLY {question_count} true/false questions.\n"
             + quality_rules +
-            "Return ONLY a valid JSON array, no markdown:\n"
+            "For normal questions:\n"
+            "  - Focus on statements about definitions or key concepts.\n"
+            "  - Answer must be exactly 'True' or 'False'.\n"
+            "For HOTS questions:\n"
+            "  - Statements should require reasoning or evaluation.\n"
+            "Return ONLY a valid JSON array:\n"
             '[{"question": "...", "answer": "True"}, ...]'
         )
     elif quiz_type == "identification":
         fmt = (
             f"Generate EXACTLY {question_count} fill-in-the-blank questions.\n"
             + quality_rules +
-            "Return ONLY a valid JSON array, no markdown:\n"
-            '[{"question": "_____ is ...", "answer": "..."}, ...]'
+            "For normal questions:\n"
+            "  - Blank key terms, definitions, or core concepts.\n"
+            "For HOTS questions:\n"
+            "  - Blanks that require reasoning or synthesis of ideas.\n"
+            "Return ONLY a valid JSON array:\n"
+            '[{"question": "_____ is defined as ...", "answer": "..."}, ...]'
         )
     else:
         return ""
