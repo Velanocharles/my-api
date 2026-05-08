@@ -25,7 +25,6 @@ app.add_middleware(
 
 # ── Config ────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-
 GROQ_MODELS = [
     "llama-3.3-70b-versatile",
     "llama3-70b-8192",
@@ -51,10 +50,8 @@ TRAILING_COMMA_RE = re.compile(r",\s*(?=[}\]])")
 
 MAX_CHUNK_SIZE = 4000
 CHUNK_OVERLAP = 200
-MAX_CHUNKS_PER_PDF = 2  # Reduce to 1-2 chunks to save API calls
-
-OVERGENERATE_FACTOR = 1.5  # Ask 50% more questions per chunk
-
+MAX_CHUNKS_PER_PDF = 6
+OVERGENERATE_FACTOR = 1.6
 AI_SEMAPHORE = asyncio.Semaphore(3)
 
 # ── Singleton AI clients ──────────────────────────────────────────────────
@@ -91,13 +88,11 @@ def extract_text_lean(file_bytes: bytes, max_chars: int = 40000) -> str:
     del parts, file_bytes
     return text[:max_chars]
 
-def chunk_text(text: str, question_count: int, max_chunks: int = MAX_CHUNKS_PER_PDF) -> list[str]:
-    """Smart chunking, limited to max_chunks for efficiency"""
+def chunk_text(text: str, question_count: int) -> list[str]:
     text_length = len(text)
-    desired_chunks = max(1, min(max_chunks, math.ceil(question_count / 25)))  # 25 questions per chunk
+    desired_chunks = max(1, min(MAX_CHUNKS_PER_PDF, math.ceil(question_count / 8)))
     if text_length <= MAX_CHUNK_SIZE or desired_chunks == 1:
         return [text]
-
     chunk_size = max(MAX_CHUNK_SIZE, math.ceil(text_length / desired_chunks))
     chunks = []
     start = 0
@@ -112,7 +107,7 @@ def chunk_text(text: str, question_count: int, max_chunks: int = MAX_CHUNKS_PER_
     return chunks if chunks else [text]
 
 # ── Similarity Check ──────────────────────────────────────────────────────
-def is_too_similar(new_q: str, seen_questions: set[str], threshold: float = 0.8) -> bool:
+def is_too_similar(new_q: str, seen_questions: set[str], threshold: float = 0.75) -> bool:
     new_words = set(new_q.lower().split())
     if len(new_words) < 4:
         return False
@@ -138,7 +133,7 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
         f"- {hot_count} HOTS questions\n"
         f"- {normal_count} concept-based questions\n"
         "- Each question must be unique and clear.\n"
-        "- Return ONLY valid JSON array."
+        "- Return ONLY a valid JSON array."
     )
     if quiz_type == "multiple_choice":
         fmt = (
@@ -228,49 +223,89 @@ def call_groq(prompt: str) -> str:
             continue
     raise last_error
 
-# ── Main Quiz Generation ──────────────────────────────────────────────────
-async def generate_quiz(quiz_type: str, question_count: int, text: str) -> list[dict]:
+async def call_ai_with_semaphore(prompt: str) -> str:
+    async with AI_SEMAPHORE:
+        return await asyncio.to_thread(call_groq, prompt)
+
+async def process_chunk(idx: int, chunk: str, q_count: int, quiz_type: str, total_chunks: int) -> list:
+    overcount = math.ceil(q_count * OVERGENERATE_FACTOR)
+    prompt = build_prompt(quiz_type, overcount, chunk, idx, total_chunks)
+    if not prompt.strip():
+        return []
+    try:
+        raw = await call_ai_with_semaphore(prompt)
+        cleaned = extract_json(raw)
+        quiz = json.loads(cleaned)
+        if not isinstance(quiz, list):
+            return []
+        valid = [q for q in quiz if validate_question(q, quiz_type)]
+        logger.info(f"Chunk {idx}: got {len(quiz)} total, {len(valid)} valid")
+        return valid
+    except Exception as e:
+        logger.warning(f"Chunk {idx} failed: {e}")
+        return []
+
+async def generate_quiz_from_text(text: str, quiz_type: str, question_count: int) -> list:
     chunks = chunk_text(text, question_count)
+    del text
+    gc.collect()
     total_chunks = len(chunks)
-    questions: list[dict] = []
-    seen_texts: set[str] = set()
-
-    per_chunk_count = math.ceil(question_count * OVERGENERATE_FACTOR / total_chunks)
-
-    for idx, chunk in enumerate(chunks):
-        prompt = build_prompt(quiz_type, per_chunk_count, chunk, idx, total_chunks)
-        if not prompt:
+    base_count = question_count // total_chunks
+    remainder = question_count % total_chunks
+    q_per_chunk = [base_count + (1 if i < remainder else 0) for i in range(total_chunks)]
+    tasks = [process_chunk(i, chunk, q_per_chunk[i], quiz_type, total_chunks)
+             for i, chunk in enumerate(chunks) if q_per_chunk[i] > 0]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    seen = set()
+    all_questions = []
+    for result in results:
+        if isinstance(result, Exception):
             continue
+        for q in result:
+            q_text = q.get("question", "").strip().lower()
+            if q_text and not is_too_similar(q_text, seen):
+                seen.add(q_text)
+                all_questions.append(q)
+    # Top-up pass if needed
+    if len(all_questions) < question_count and len(all_questions) > 0:
+        shortfall = question_count - len(all_questions)
+        top_chunk = chunks[0]
+        top_questions = await process_chunk(0, top_chunk, shortfall, quiz_type, total_chunks)
+        for q in top_questions:
+            q_text = q.get("question", "").strip().lower()
+            if q_text and not is_too_similar(q_text, seen):
+                seen.add(q_text)
+                all_questions.append(q)
+    return all_questions[:question_count]
 
-        async with AI_SEMAPHORE:
-            raw_resp = await asyncio.to_thread(call_groq, prompt)
-        json_str = extract_json(raw_resp)
-        try:
-            chunk_questions = json.loads(json_str)
-        except:
-            continue
-
-        for q in chunk_questions:
-            if validate_question(q, quiz_type) and not is_too_similar(q["question"], seen_texts):
-                questions.append(q)
-                seen_texts.add(q["question"])
-            if len(questions) >= question_count:
-                break
-        if len(questions) >= question_count:
-            break
-
-        gc.collect()
-
-    return questions[:question_count]
-
-# ── API Endpoint ─────────────────────────────────────────────────────────
+# ── Endpoints ─────────────────────────────────────────────────────────────
 @app.post("/generate-quiz")
-async def generate_quiz_endpoint(
+async def generate_quiz(
     file: UploadFile = File(...),
     quiz_type: str = Form(...),
-    question_count: int = Form(...)
+    question_count: int = Form(...),
 ):
     file_bytes = await file.read()
     text = extract_text_lean(file_bytes)
-    questions = await generate_quiz(quiz_type, question_count, text)
-    return {"questions": questions}
+    del file_bytes
+    gc.collect()
+    if not text.strip():
+        return {"error": "PDF text extraction failed"}
+    quiz = await generate_quiz_from_text(text, quiz_type, question_count)
+    del text
+    gc.collect()
+    return {"quiz": quiz, "quiz_type": quiz_type, "total_questions": len(quiz), "requested": question_count}
+
+@app.get("/")
+async def health():
+    return {
+        "status": "ok",
+        "groq": "configured" if GROQ_API_KEY else "not set",
+        "gemini_keys": f"{len(GEMINI_API_KEYS)} configured",
+        "priority": "Groq first, then Gemini"
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run("main:app", host="0.0.0.0", port=port, log_level="info", reload=False)
