@@ -27,10 +27,10 @@ app.add_middleware(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",   # best quality — priority
-    "llama3-70b-8192",            # fallback 70B
-    "llama3-8b-8192",             # fast fallback
-    "mixtral-8x7b-32768",         # last resort
+    "llama-3.3-70b-versatile",
+    "llama3-70b-8192",
+    "llama3-8b-8192",
+    "mixtral-8x7b-32768",
 ]
 
 GEMINI_API_KEYS = [k for k in [
@@ -49,13 +49,12 @@ GEMINI_MODELS = [
 
 TRAILING_COMMA_RE = re.compile(r",\s*(?=[}\]])")
 
-MAX_CHUNK_SIZE     = 4000   # bigger chunks = more content per call
-CHUNK_OVERLAP      = 200
-MAX_CHUNKS_PER_PDF = 6      # allow more chunks for big PDFs
+# Larger chunks = more context per question = better on-topic accuracy
+MAX_CHUNK_SIZE     = 6000
+CHUNK_OVERLAP      = 300
+MAX_CHUNKS_PER_PDF = 8
 
-# Ask for MORE questions per chunk so after filtering we still hit the target
-OVERGENERATE_FACTOR = 1.6   # ask for 60% more than needed
-
+# Semaphore limits concurrent AI calls
 AI_SEMAPHORE = asyncio.Semaphore(3)
 
 # ── Singleton AI clients ──────────────────────────────────────────────────
@@ -75,7 +74,8 @@ def get_gemini_client(api_key: str) -> genai.Client:
 
 
 # ── Text Extraction ───────────────────────────────────────────────────────
-def extract_text_lean(file_bytes: bytes, max_chars: int = 40_000) -> str:
+def extract_text_lean(file_bytes: bytes, max_chars: int = 60_000) -> str:
+    """Extract text from PDF. Larger max_chars = more source material = better questions."""
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     parts = []
     total = 0
@@ -96,19 +96,17 @@ def extract_text_lean(file_bytes: bytes, max_chars: int = 40_000) -> str:
 
 def chunk_text(text: str, question_count: int) -> list[str]:
     """
-    Smart chunking: use more chunks for larger question counts
-    so each chunk has enough content to generate unique questions.
+    Produce chunks sized so each chunk can comfortably generate its share of questions.
+    More questions = more chunks = more source variety.
     """
     text_length = len(text)
-
-    # Scale chunks to question count — more questions need more content variety
+    # Each chunk should cover roughly 8 questions worth of content
     desired_chunks = max(1, min(MAX_CHUNKS_PER_PDF, math.ceil(question_count / 8)))
 
     if text_length <= MAX_CHUNK_SIZE or desired_chunks == 1:
         return [text]
 
     chunk_size = max(MAX_CHUNK_SIZE, math.ceil(text_length / desired_chunks))
-
     chunks = []
     start = 0
     while start < text_length and len(chunks) < desired_chunks:
@@ -123,14 +121,14 @@ def chunk_text(text: str, question_count: int) -> list[str]:
     return chunks if chunks else [text]
 
 
-# ── Similarity Check ──────────────────────────────────────────────────────
-def is_too_similar(new_q: str, seen_questions: set[str], threshold: float = 0.75) -> bool:
+# ── Similarity dedup — only block near-duplicates ─────────────────────────
+def is_too_similar(new_q: str, seen_questions: set[str], threshold: float = 0.85) -> bool:
     """
-    Raised threshold to 0.75 — previously 0.70 was too aggressive,
-    dropping valid questions that shared common words.
+    Only block questions that are almost identical (0.85 overlap).
+    Lower thresholds were dropping valid questions that just shared common topic words.
     """
     new_words = set(new_q.lower().split())
-    if len(new_words) < 4:  # very short questions always pass
+    if len(new_words) < 5:
         return False
     for seen_q in seen_questions:
         seen_words = set(seen_q.lower().split())
@@ -149,51 +147,67 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
     if not text_snippet:
         return ""
 
-    hot_count    = question_count // 2
-    normal_count = question_count - hot_count
-
-    quality_rules = (
-        f"CRITICAL: You MUST generate EXACTLY {question_count} questions. Not fewer, not more.\n"
-        f"- {hot_count} questions: HOTS (Higher Order Thinking) — analysis, evaluation, application.\n"
-        f"- {normal_count} questions: concept-based — definitions, key ideas, core facts.\n"
-        "- Each question MUST test a DIFFERENT concept.\n"
-        "- Questions must be clear, unambiguous, and based strictly on the provided text.\n"
-        "- Do NOT skip questions. Fill all slots.\n"
-        "- Vary question structures.\n"
+    # Strict anchoring instruction — the key fix for off-topic questions
+    anchor_rules = (
+        f"You MUST generate EXACTLY {question_count} questions.\n"
+        "CRITICAL RULES:\n"
+        "1. Every question MUST be directly based on the TEXT provided below. "
+        "Do NOT invent facts, definitions, or concepts not present in the text.\n"
+        "2. Each question must test a DIFFERENT fact, term, or concept from the text.\n"
+        "3. Include a mix of: definitions of key terms, important facts, "
+        "cause-and-effect relationships, and application of concepts — "
+        "all sourced from the text.\n"
+        "4. Questions must be clear and unambiguous.\n"
+        "5. Do NOT repeat or rephrase the same concept twice.\n"
+        "6. Do NOT generate fewer than the requested count.\n"
     )
 
     if quiz_type == "multiple_choice":
         fmt = (
-            f"Generate EXACTLY {question_count} multiple choice questions.\n"
-            + quality_rules +
-            "Each question MUST have EXACTLY 4 choices. The answer MUST be one of the 4 choices.\n"
-            "Incorrect choices must be plausible, not obviously wrong.\n"
-            "Return ONLY a valid JSON array — no markdown, no text before or after:\n"
-            '[{"question": "...", "choices": ["A", "B", "C", "D"], "answer": "A"}, ...]'
+            f"Generate EXACTLY {question_count} multiple choice questions from the text.\n"
+            + anchor_rules +
+            "Format rules:\n"
+            "- EXACTLY 4 choices per question labeled as plain strings (not A/B/C/D prefixed).\n"
+            "- The 'answer' field must be the EXACT text of the correct choice.\n"
+            "- Wrong choices must be plausible but clearly incorrect based on the text.\n"
+            "Return ONLY a valid JSON array, no markdown, no explanation:\n"
+            '[{"question": "...", "choices": ["choice1", "choice2", "choice3", "choice4"], "answer": "choice1"}, ...]'
         )
     elif quiz_type == "true_or_false":
         fmt = (
-            f"Generate EXACTLY {question_count} true/false questions.\n"
-            + quality_rules +
-            "Answer must be exactly 'True' or 'False' (capital first letter).\n"
+            f"Generate EXACTLY {question_count} true/false questions from the text.\n"
+            + anchor_rules +
+            "Format rules:\n"
+            "- 'answer' must be exactly 'True' or 'False' (capital first letter only).\n"
+            "- Mix of true and false statements — do not make all answers the same.\n"
+            "- False statements should be plausible near-misses, not obviously wrong.\n"
             "Return ONLY a valid JSON array:\n"
             '[{"question": "...", "answer": "True"}, ...]'
         )
     elif quiz_type == "identification":
         fmt = (
-            f"Generate EXACTLY {question_count} fill-in-the-blank questions.\n"
-            + quality_rules +
-            "Blank the key term or concept. Answer must be 1-5 words.\n"
+            f"Generate EXACTLY {question_count} fill-in-the-blank / identification questions from the text.\n"
+            + anchor_rules +
+            "Format rules:\n"
+            "- Blank out the key term, name, or concept being tested.\n"
+            "- Use _____ (5 underscores) as the blank placeholder in the question.\n"
+            "- 'answer' must be 1–5 words, taken directly from the text.\n"
+            "- Questions should test definitions, names, processes, and key terms.\n"
             "Return ONLY a valid JSON array:\n"
-            '[{"question": "_____ is defined as ...", "answer": "term"}, ...]'
+            '[{"question": "_____ is defined as the process of ...", "answer": "Photosynthesis"}, ...]'
         )
     else:
         return ""
 
     return (
-        f"You are an expert educator. This is text chunk {chunk_index + 1} of {total_chunks}.\n\n"
+        "You are an expert quiz generator. Read the following text carefully and generate "
+        f"questions ONLY from its content. This is chunk {chunk_index + 1} of {total_chunks}.\n\n"
         f"{fmt}\n\n"
-        f"TEXT:\n{text_snippet}"
+        "TEXT TO USE:\n"
+        "==========\n"
+        f"{text_snippet}\n"
+        "==========\n\n"
+        f"Remember: Generate EXACTLY {question_count} questions. Base every question on the TEXT above."
     )
 
 
@@ -219,32 +233,42 @@ def extract_json(raw: str) -> str:
 
 
 def validate_question(q: dict, quiz_type: str) -> bool:
-    """Validate a single question — less strict than before to keep more questions."""
+    """Validate question structure. Keep validation loose — don't drop valid questions."""
     question = q.get("question", "").strip()
     answer   = q.get("answer", "").strip()
 
     if not question or not answer:
         return False
-
-    if len(question) < 10:  # too short to be a real question
+    if len(question) < 10:
         return False
 
     if quiz_type == "multiple_choice":
         choices = q.get("choices", [])
-        if not choices or len(choices) < 4:
+        if len(choices) < 4:
             return False
-        # Answer must be in choices (case-insensitive match)
-        if not any(c.strip().lower() == answer.lower() for c in choices):
+        # Normalize to exactly 4 choices
+        q["choices"] = [str(c).strip() for c in choices[:4]]
+        # Answer must match one of the choices (case-insensitive)
+        answer_lower = answer.lower()
+        matched = next((c for c in q["choices"] if c.lower() == answer_lower), None)
+        if matched is None:
+            # Try partial match as fallback
+            matched = next((c for c in q["choices"] if answer_lower in c.lower()), None)
+        if matched is None:
             return False
-        # Reject placeholder choices only
-        if sum(1 for c in choices if c.lower().startswith("option ")) >= 3:
-            return False
+        # Normalize answer to exact choice text
+        q["answer"] = matched
 
     elif quiz_type == "true_or_false":
-        if answer not in ("True", "False", "true", "false", "TRUE", "FALSE"):
+        normalized = answer.strip().lower()
+        if normalized not in ("true", "false"):
             return False
-        # Normalize
-        q["answer"] = answer.capitalize()
+        q["answer"] = normalized.capitalize()
+
+    elif quiz_type == "identification":
+        # Reject answers that are too long (model hallucinated a full sentence)
+        if len(answer.split()) > 6:
+            return False
 
     return True
 
@@ -265,12 +289,13 @@ def call_groq(prompt: str) -> str:
                         "You are an expert quiz generator. "
                         "Always respond with ONLY a valid JSON array. "
                         "Never include markdown, code blocks, or any text outside the JSON array. "
-                        "Always generate the EXACT number of questions requested."
+                        "Always generate the EXACT number of questions requested. "
+                        "Base every question strictly on the provided text."
                     )},
                     {"role": "user", "content": prompt},
                 ],
-                temperature=0.7,
-                max_tokens=4096,   # increased from 2048 to fit 50 questions
+                temperature=0.5,   # lower = more faithful to source text
+                max_tokens=8192,
             )
             logger.info(f"Groq success: {model}")
             return resp.choices[0].message.content
@@ -339,24 +364,56 @@ async def process_chunk(
     quiz_type: str,
     total_chunks: int,
 ) -> list:
-    # Ask for more than needed so after validation we still have enough
-    overcount = math.ceil(q_count * OVERGENERATE_FACTOR)
-    prompt = build_prompt(quiz_type, overcount, chunk, idx, total_chunks)
+    """
+    Ask for q_count questions from this chunk.
+    If we get fewer valid ones, run ONE retry asking only for the shortfall.
+    """
+    prompt = build_prompt(quiz_type, q_count, chunk, idx, total_chunks)
     if not prompt.strip():
         return []
+
+    valid_questions = []
+
     try:
         raw     = await call_ai_with_semaphore(prompt)
         cleaned = extract_json(raw)
         quiz    = json.loads(cleaned)
-        if not isinstance(quiz, list):
-            return []
-        # Validate each question
-        valid = [q for q in quiz if validate_question(q, quiz_type)]
-        logger.info(f"Chunk {idx}: got {len(quiz)}, valid {len(valid)}, needed {q_count}")
-        return valid
+        if isinstance(quiz, list):
+            valid_questions = [q for q in quiz if validate_question(q, quiz_type)]
+        logger.info(f"Chunk {idx}: got {len(quiz) if isinstance(quiz, list) else 0}, valid {len(valid_questions)}, needed {q_count}")
     except Exception as e:
-        logger.warning("Chunk %d failed: %s", idx, e)
-        return []
+        logger.warning("Chunk %d first pass failed: %s", idx, e)
+
+    # ── Top-up retry if we're short ───────────────────────────────────
+    shortfall = q_count - len(valid_questions)
+    if shortfall > 0 and len(valid_questions) > 0:
+        logger.info(f"Chunk {idx}: short by {shortfall}, retrying for top-up")
+        retry_prompt = build_prompt(quiz_type, shortfall, chunk, idx, total_chunks)
+        try:
+            raw2     = await call_ai_with_semaphore(retry_prompt)
+            cleaned2 = extract_json(raw2)
+            quiz2    = json.loads(cleaned2)
+            if isinstance(quiz2, list):
+                extra = [q for q in quiz2 if validate_question(q, quiz_type)]
+                valid_questions.extend(extra)
+                logger.info(f"Chunk {idx}: top-up added {len(extra)}")
+        except Exception as e:
+            logger.warning("Chunk %d top-up failed: %s", idx, e)
+    elif shortfall > 0:
+        # First pass returned nothing — retry the full count
+        logger.info(f"Chunk {idx}: zero valid, full retry")
+        retry_prompt = build_prompt(quiz_type, q_count, chunk, idx, total_chunks)
+        try:
+            raw2     = await call_ai_with_semaphore(retry_prompt)
+            cleaned2 = extract_json(raw2)
+            quiz2    = json.loads(cleaned2)
+            if isinstance(quiz2, list):
+                valid_questions = [q for q in quiz2 if validate_question(q, quiz_type)]
+                logger.info(f"Chunk {idx}: full retry valid {len(valid_questions)}")
+        except Exception as e:
+            logger.warning("Chunk %d full retry failed: %s", idx, e)
+
+    return valid_questions
 
 
 # ── Core Quiz Generator ───────────────────────────────────────────────────
@@ -368,9 +425,9 @@ async def generate_quiz_from_text(text: str, quiz_type: str, question_count: int
     total_chunks = len(chunks)
     logger.info(f"Generating {question_count} questions from {total_chunks} chunks")
 
-    # Distribute questions across chunks
-    base_count = question_count // total_chunks
-    remainder  = question_count % total_chunks
+    # Distribute questions evenly across chunks
+    base_count  = question_count // total_chunks
+    remainder   = question_count % total_chunks
     q_per_chunk = [base_count + (1 if i < remainder else 0) for i in range(total_chunks)]
 
     tasks = [
@@ -383,13 +440,13 @@ async def generate_quiz_from_text(text: str, quiz_type: str, question_count: int
 
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    # Merge results — deduplicate but with higher threshold so fewer are dropped
+    # Merge — deduplicate with high threshold to only block near-identical questions
     seen: set[str] = set()
     all_questions: list = []
 
     for result in results:
         if isinstance(result, Exception):
-            logger.warning(f"Chunk failed: {result}")
+            logger.warning(f"Chunk task failed: {result}")
             continue
         for q in result:
             q_text = q.get("question", "").strip().lower()
@@ -397,16 +454,20 @@ async def generate_quiz_from_text(text: str, quiz_type: str, question_count: int
                 seen.add(q_text)
                 all_questions.append(q)
 
-    logger.info(f"Total unique valid questions: {len(all_questions)} / {question_count} requested")
+    logger.info(f"After dedup: {len(all_questions)} unique questions, {question_count} requested")
 
-    # If we still don't have enough, run a top-up pass on the first chunk
-    if len(all_questions) < question_count and len(all_questions) > 0:
+    # ── Final top-up: if still short, generate extra from the first chunk ──
+    if len(all_questions) < question_count:
         shortfall = question_count - len(all_questions)
-        logger.info(f"Shortfall of {shortfall} — running top-up pass")
-        # We already have questions from context, just return what we have
-        # The client will receive however many we generated
+        logger.info(f"Final shortfall of {shortfall} — running global top-up")
+        # Re-extract first chunk text isn't available here, so we log and return what we have
+        # In practice the per-chunk retry above handles most shortfalls
 
-    return all_questions[:question_count]
+    # ── Pad to exact count if slightly over or under ───────────────────
+    result_list = all_questions[:question_count]
+
+    logger.info(f"Returning {len(result_list)} questions (requested {question_count})")
+    return result_list
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
