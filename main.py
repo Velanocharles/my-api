@@ -477,6 +477,13 @@ async def generate_quiz(
     quiz_type: str = Form(...),
     question_count: int = Form(...),
 ):
+    # Enforce minimum of 10 questions
+    if question_count < 10:
+        return {
+            "error": f"Minimum of 10 questions required. You requested {question_count}.",
+            "min_questions": 10,
+        }
+
     file_bytes = await file.read()
     text = extract_text_lean(file_bytes)
     del file_bytes
@@ -506,6 +513,14 @@ async def generate_quiz_multiple(
     question_count: int = Form(...),
 ):
     async def handle_file(file: UploadFile) -> dict:
+        # Enforce minimum of 10 questions per file
+        if question_count < 10:
+            return {
+                "file_name": file.filename,
+                "error": f"Minimum of 10 questions required. You requested {question_count}.",
+                "quiz": [],
+            }
+
         file_bytes = await file.read()
         text = extract_text_lean(file_bytes)
         del file_bytes
