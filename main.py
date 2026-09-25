@@ -54,6 +54,10 @@ MAX_CHUNK_SIZE     = 6000
 CHUNK_OVERLAP      = 300
 MAX_CHUNKS_PER_PDF = 8
 
+# Summary chunking — separate from quiz chunking since it isn't tied to a question count
+SUMMARY_MAX_CHUNK_CHARS = 9000
+SUMMARY_MAX_CHUNKS      = 6
+
 # Semaphore limits concurrent AI calls
 AI_SEMAPHORE = asyncio.Semaphore(3)
 
@@ -121,6 +125,31 @@ def chunk_text(text: str, question_count: int) -> list[str]:
     return chunks if chunks else [text]
 
 
+def chunk_text_for_summary(text: str,
+                            max_chunk_chars: int = SUMMARY_MAX_CHUNK_CHARS,
+                            max_chunks: int = SUMMARY_MAX_CHUNKS) -> list[str]:
+    """
+    Simple even split for summarization — no overlap needed since we're not
+    matching questions to specific sentences, just covering the whole document.
+    """
+    text_length = len(text)
+    if text_length <= max_chunk_chars:
+        return [text]
+
+    desired_chunks = min(max_chunks, math.ceil(text_length / max_chunk_chars))
+    chunk_size = math.ceil(text_length / desired_chunks)
+    chunks = []
+    start = 0
+    while start < text_length and len(chunks) < desired_chunks:
+        end = min(start + chunk_size, text_length)
+        piece = text[start:end].strip()
+        if piece:
+            chunks.append(piece)
+        start = end
+
+    return chunks if chunks else [text]
+
+
 # ── Similarity dedup — only block near-duplicates ─────────────────────────
 def is_too_similar(new_q: str, seen_questions: set[str], threshold: float = 0.85) -> bool:
     """
@@ -140,7 +169,7 @@ def is_too_similar(new_q: str, seen_questions: set[str], threshold: float = 0.85
     return False
 
 
-# ── Prompt Builder ────────────────────────────────────────────────────────
+# ── Prompt Builders — Quiz ────────────────────────────────────────────────
 def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
                  chunk_index: int, total_chunks: int) -> str:
     text_snippet = text_chunk.strip()
@@ -211,7 +240,60 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
     )
 
 
-# ── JSON Extractor ────────────────────────────────────────────────────────
+# ── Prompt Builders — Summary ─────────────────────────────────────────────
+SUMMARY_SYSTEM_MSG = (
+    "You are an expert academic summarizer. Always respond with plain readable text only — "
+    "no markdown headers, no JSON, no code blocks. Base your summary strictly on the provided text."
+)
+
+
+def build_summary_prompt(text_chunk: str, chunk_index: int, total_chunks: int) -> str:
+    text_snippet = text_chunk.strip()
+    if not text_snippet:
+        return ""
+
+    scope_note = (
+        f"This is part {chunk_index + 1} of {total_chunks} of a longer document. "
+        "Summarize ONLY this part; do not reference the other parts.\n\n"
+        if total_chunks > 1 else ""
+    )
+
+    return (
+        "You are an expert academic summarizer. Read the following text and write a clear, "
+        "well-organized summary for a student studying this material.\n\n"
+        f"{scope_note}"
+        "Rules:\n"
+        "1. Base the summary ONLY on the text provided — do not add outside facts.\n"
+        "2. Use short paragraphs in plain language.\n"
+        "3. End with a 'Key Topics:' section as a bulleted list ('- ' per line) of the main "
+        "terms and concepts.\n"
+        "4. Do not use markdown headers (#) or code blocks — plain paragraphs only.\n\n"
+        "TEXT TO SUMMARIZE:\n"
+        "==========\n"
+        f"{text_snippet}\n"
+        "==========\n"
+    )
+
+
+def build_combine_prompt(partial_summaries: list[str]) -> str:
+    joined = "\n\n---\n\n".join(
+        f"Part {i + 1} summary:\n{s}" for i, s in enumerate(partial_summaries)
+    )
+    return (
+        "You are an expert academic summarizer. Below are summaries of different parts of the "
+        "same document, in order. Combine them into ONE coherent summary of the whole document.\n\n"
+        "Rules:\n"
+        "1. Merge overlapping points and remove repetition — read as one unified summary, "
+        "not a list of parts.\n"
+        "2. Use short paragraphs in plain language.\n"
+        "3. End with a single 'Key Topics:' section as a bulleted list ('- ' per line) covering "
+        "the whole document.\n"
+        "4. Do not use markdown headers (#) or code blocks — plain paragraphs only.\n\n"
+        f"{joined}\n"
+    )
+
+
+# ── JSON Extractor (quiz only) ────────────────────────────────────────────
 def extract_json(raw: str) -> str:
     raw = raw.strip().replace("```json", "").replace("```", "").strip()
     for sc, ec in [("[", "]"), ("{", "}")]:
@@ -274,10 +356,20 @@ def validate_question(q: dict, quiz_type: str) -> bool:
 
 
 # ── AI Calls ──────────────────────────────────────────────────────────────
-def call_groq(prompt: str) -> str:
+DEFAULT_QUIZ_SYSTEM_MSG = (
+    "You are an expert quiz generator. "
+    "Always respond with ONLY a valid JSON array. "
+    "Never include markdown, code blocks, or any text outside the JSON array. "
+    "Always generate the EXACT number of questions requested. "
+    "Base every question strictly on the provided text."
+)
+
+
+def call_groq(prompt: str, system_prompt: str | None = None) -> str:
     client = get_groq_client()
     if client is None:
         raise Exception("GROQ_API_KEY not set")
+    sys_msg = system_prompt or DEFAULT_QUIZ_SYSTEM_MSG
     last_error = None
     for model in GROQ_MODELS:
         try:
@@ -285,13 +377,7 @@ def call_groq(prompt: str) -> str:
             resp = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": (
-                        "You are an expert quiz generator. "
-                        "Always respond with ONLY a valid JSON array. "
-                        "Never include markdown, code blocks, or any text outside the JSON array. "
-                        "Always generate the EXACT number of questions requested. "
-                        "Base every question strictly on the provided text."
-                    )},
+                    {"role": "system", "content": sys_msg},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.5,   # lower = more faithful to source text
@@ -328,7 +414,7 @@ def _is_rate_limit_error(e: Exception) -> bool:
     return any(kw in msg for kw in ("rate limit", "429", "quota", "too many"))
 
 
-async def call_ai_with_retry(prompt: str, retries: int = 2) -> str:
+async def call_ai_with_retry(prompt: str, retries: int = 2, system_prompt: str | None = None) -> str:
     async def try_provider(fn):
         last_err = None
         for attempt in range(retries):
@@ -344,19 +430,23 @@ async def call_ai_with_retry(prompt: str, retries: int = 2) -> str:
 
     if GROQ_API_KEY:
         try:
-            return await try_provider(call_groq)
+            # Groq is the only provider that takes a separate system message here;
+            # wrap it so a custom system_prompt (e.g. for summaries) gets through
+            # without changing call_groq's signature usage elsewhere.
+            groq_fn = (lambda p: call_groq(p, system_prompt=system_prompt)) if system_prompt else call_groq
+            return await try_provider(groq_fn)
         except Exception:
             pass
 
     return await try_provider(call_gemini)
 
 
-async def call_ai_with_semaphore(prompt: str) -> str:
+async def call_ai_with_semaphore(prompt: str, system_prompt: str | None = None) -> str:
     async with AI_SEMAPHORE:
-        return await call_ai_with_retry(prompt)
+        return await call_ai_with_retry(prompt, system_prompt=system_prompt)
 
 
-# ── Per-chunk processor ───────────────────────────────────────────────────
+# ── Per-chunk processor — Quiz ────────────────────────────────────────────
 async def process_chunk(
     idx: int,
     chunk: str,
@@ -416,6 +506,19 @@ async def process_chunk(
     return valid_questions
 
 
+# ── Per-chunk processor — Summary ─────────────────────────────────────────
+async def summarize_chunk(idx: int, chunk: str, total_chunks: int) -> str:
+    prompt = build_summary_prompt(chunk, idx, total_chunks)
+    if not prompt.strip():
+        return ""
+    try:
+        raw = await call_ai_with_semaphore(prompt, system_prompt=SUMMARY_SYSTEM_MSG)
+        return raw.strip()
+    except Exception as e:
+        logger.warning("Summary chunk %d failed: %s", idx, e)
+        return ""
+
+
 # ── Core Quiz Generator ───────────────────────────────────────────────────
 async def generate_quiz_from_text(text: str, quiz_type: str, question_count: int) -> list:
     chunks = chunk_text(text, question_count)
@@ -468,6 +571,39 @@ async def generate_quiz_from_text(text: str, quiz_type: str, question_count: int
 
     logger.info(f"Returning {len(result_list)} questions (requested {question_count})")
     return result_list
+
+
+# ── Core Summary Generator ────────────────────────────────────────────────
+async def generate_summary_from_text(text: str) -> str:
+    chunks = chunk_text_for_summary(text)
+    del text
+    gc.collect()
+
+    total_chunks = len(chunks)
+    logger.info(f"Summarizing document from {total_chunks} chunk(s)")
+
+    if total_chunks == 1:
+        summary = await summarize_chunk(0, chunks[0], 1)
+        return summary or "Could not generate a summary for this document."
+
+    tasks = [summarize_chunk(i, c, total_chunks) for i, c in enumerate(chunks)]
+    partials = await asyncio.gather(*tasks, return_exceptions=True)
+    clean_partials = [p for p in partials if isinstance(p, str) and p.strip()]
+
+    if not clean_partials:
+        return "Could not generate a summary for this document."
+    if len(clean_partials) == 1:
+        return clean_partials[0]
+
+    logger.info(f"Combining {len(clean_partials)} partial summaries")
+    combine_prompt = build_combine_prompt(clean_partials)
+    try:
+        final = await call_ai_with_semaphore(combine_prompt, system_prompt=SUMMARY_SYSTEM_MSG)
+        return final.strip()
+    except Exception as e:
+        logger.warning("Summary combine pass failed: %s", e)
+        # Fall back to the partial summaries stitched together rather than failing outright
+        return "\n\n".join(clean_partials)
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────────
@@ -555,6 +691,25 @@ async def generate_quiz_multiple(
             clean.append(r)
 
     return {"results": clean}
+
+
+@app.post("/generate-summary")
+async def generate_summary(file: UploadFile = File(...)):
+    file_bytes = await file.read()
+    text = extract_text_lean(file_bytes, max_chars=60_000)
+    del file_bytes
+    gc.collect()
+
+    if not text.strip():
+        return {"error": "Could not extract text from PDF or PDF is empty."}
+
+    summary = await generate_summary_from_text(text)
+    del text
+    gc.collect()
+
+    logger.info(f"Summary generated: {len(summary)} chars")
+
+    return {"summary": summary}
 
 
 @app.get("/")
