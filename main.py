@@ -240,10 +240,29 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
     )
 
 
-# ── Prompt Builders — Summary ─────────────────────────────────────────────
 SUMMARY_SYSTEM_MSG = (
-    "You are an expert academic summarizer. Always respond with plain readable text only — "
-    "no markdown headers, no JSON, no code blocks. Base your summary strictly on the provided text."
+    "You are an expert academic summarizer. Respond in plain readable text only. "
+    "The ONLY formatting allowed is **double asterisks** around important terms, and "
+    "'- ' bullets. No # headers, no code blocks, no JSON. "
+    "Base your summary strictly on the provided text."
+)
+
+SUMMARY_FORMAT_RULES = (
+    "Format exactly like this:\n"
+    "Overview:\n"
+    "A 2-3 sentence big-picture paragraph.\n\n"
+    "<Short Section Title>:\n"
+    "A short paragraph (2-4 sentences). Repeat for each major theme.\n\n"
+    "Key Topics:\n"
+    "- **Term**: one-line explanation\n"
+    "- **Term**: one-line explanation\n\n"
+    "Rules:\n"
+    "1. Base the summary ONLY on the text provided — no outside facts.\n"
+    "2. Wrap important terms, names, definitions, numbers, and key concepts in "
+    "**double asterisks**. Bold 2-5 items per paragraph — never whole sentences.\n"
+    "3. Section titles are plain text on their own line ending with a colon (no # or **).\n"
+    "4. Keep paragraphs short and in plain language.\n"
+    "5. Key Topics must have 5-10 bullets, each starting with a **bold term**.\n"
 )
 
 
@@ -260,14 +279,9 @@ def build_summary_prompt(text_chunk: str, chunk_index: int, total_chunks: int) -
 
     return (
         "You are an expert academic summarizer. Read the following text and write a clear, "
-        "well-organized summary for a student studying this material.\n\n"
+        "well-organized study summary for a student.\n\n"
         f"{scope_note}"
-        "Rules:\n"
-        "1. Base the summary ONLY on the text provided — do not add outside facts.\n"
-        "2. Use short paragraphs in plain language.\n"
-        "3. End with a 'Key Topics:' section as a bulleted list ('- ' per line) of the main "
-        "terms and concepts.\n"
-        "4. Do not use markdown headers (#) or code blocks — plain paragraphs only.\n\n"
+        f"{SUMMARY_FORMAT_RULES}\n"
         "TEXT TO SUMMARIZE:\n"
         "==========\n"
         f"{text_snippet}\n"
@@ -281,14 +295,10 @@ def build_combine_prompt(partial_summaries: list[str]) -> str:
     )
     return (
         "You are an expert academic summarizer. Below are summaries of different parts of the "
-        "same document, in order. Combine them into ONE coherent summary of the whole document.\n\n"
-        "Rules:\n"
-        "1. Merge overlapping points and remove repetition — read as one unified summary, "
-        "not a list of parts.\n"
-        "2. Use short paragraphs in plain language.\n"
-        "3. End with a single 'Key Topics:' section as a bulleted list ('- ' per line) covering "
-        "the whole document.\n"
-        "4. Do not use markdown headers (#) or code blocks — plain paragraphs only.\n\n"
+        "same document, in order. Combine them into ONE coherent summary of the whole document. "
+        "Merge overlapping points, remove repetition, and keep the **bold** key terms.\n\n"
+        f"{SUMMARY_FORMAT_RULES}\n"
+        "The Key Topics section must cover the whole document, once, with no duplicates.\n\n"
         f"{joined}\n"
     )
 
