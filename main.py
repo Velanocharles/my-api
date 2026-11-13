@@ -26,11 +26,14 @@ app.add_middleware(
 # ── Config ────────────────────────────────────────────────────────────────
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
+# Groq free plan gives EACH model its own limits (30 RPM, ~1K requests/day,
+# 8K tokens/min, 200K tokens/day), so listing several models multiplies capacity.
+# Confirm these IDs against your key:
+#   curl https://api.groq.com/openai/v1/models -H "Authorization: Bearer $GROQ_API_KEY"
 GROQ_MODELS = [
-    "llama-3.3-70b-versatile",
-    "llama3-70b-8192",
-    "llama3-8b-8192",
-    "mixtral-8x7b-32768",
+    "openai/gpt-oss-120b",   # best quality, tried first
+    "openai/gpt-oss-20b",    # separate free quota, faster
+    "qwen/qwen3.8-27b",      # separate free quota (verify ID with /models)
 ]
 
 GEMINI_API_KEYS = [k for k in [
@@ -42,7 +45,10 @@ GEMINI_API_KEYS = [k for k in [
     os.getenv("GOOGLE_API_KEY_6"),
 ] if k]
 
+# Fallback only. Remove any model that fails your check (some 2.5 models
+# have conflicting shutdown info).
 GEMINI_MODELS = [
+    "models/gemini-3.1-flash-lite",
     "models/gemini-2.5-flash-lite",
     "models/gemini-2.5-flash",
 ]
@@ -58,8 +64,8 @@ MAX_CHUNKS_PER_PDF = 8
 SUMMARY_MAX_CHUNK_CHARS = 9000
 SUMMARY_MAX_CHUNKS      = 6
 
-# Semaphore limits concurrent AI calls
-AI_SEMAPHORE = asyncio.Semaphore(3)
+# Semaphore limits concurrent AI calls (kept low: Groq free tier is 8K tokens/min per model)
+AI_SEMAPHORE = asyncio.Semaphore(2)
 
 # ── Singleton AI clients ──────────────────────────────────────────────────
 _groq_client: Groq | None = None
@@ -240,6 +246,7 @@ def build_prompt(quiz_type: str, question_count: int, text_chunk: str,
     )
 
 
+# ── Prompt Builders — Summary ─────────────────────────────────────────────
 SUMMARY_SYSTEM_MSG = (
     "You are an expert academic summarizer. Respond in plain readable text only. "
     "The ONLY formatting allowed is **double asterisks** around important terms, and "
@@ -376,6 +383,7 @@ DEFAULT_QUIZ_SYSTEM_MSG = (
 
 
 def call_groq(prompt: str, system_prompt: str | None = None) -> str:
+    """PRIMARY provider. Tries each Groq model in order; each has its own free quota."""
     client = get_groq_client()
     if client is None:
         raise Exception("GROQ_API_KEY not set")
@@ -391,10 +399,13 @@ def call_groq(prompt: str, system_prompt: str | None = None) -> str:
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.5,   # lower = more faithful to source text
-                max_tokens=8192,
+                max_tokens=4096,   # kept modest: free tier is 8K tokens/min per model
             )
+            content = resp.choices[0].message.content
+            if not content or not content.strip():
+                raise Exception("Empty response (reasoning may have used all tokens)")
             logger.info(f"Groq success: {model}")
-            return resp.choices[0].message.content
+            return content
         except Exception as e:
             logger.warning(f"Groq model {model} failed: {e}")
             last_error = e
@@ -403,12 +414,13 @@ def call_groq(prompt: str, system_prompt: str | None = None) -> str:
 
 
 def call_gemini(prompt: str) -> str:
+    """FALLBACK provider. Only used when Groq fails."""
     last_error = None
     for api_key in GEMINI_API_KEYS:
         client = get_gemini_client(api_key)
         for model_name in GEMINI_MODELS:
             try:
-                logger.info(f"Trying Gemini model: {model_name}")
+                logger.info(f"Falling back to Gemini model: {model_name}")
                 resp = client.models.generate_content(model=model_name, contents=prompt)
                 logger.info(f"Gemini success: {model_name}")
                 return resp.text
@@ -438,16 +450,15 @@ async def call_ai_with_retry(prompt: str, retries: int = 2, system_prompt: str |
                     break
         raise last_err
 
+    # 1) Groq first
     if GROQ_API_KEY:
         try:
-            # Groq is the only provider that takes a separate system message here;
-            # wrap it so a custom system_prompt (e.g. for summaries) gets through
-            # without changing call_groq's signature usage elsewhere.
-            groq_fn = (lambda p: call_groq(p, system_prompt=system_prompt)) if system_prompt else call_groq
+            groq_fn = lambda p: call_groq(p, system_prompt=system_prompt)
             return await try_provider(groq_fn)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"Groq failed, rolling back to Gemini: {e}")
 
+    # 2) Gemini as the rollback
     return await try_provider(call_gemini)
 
 
@@ -727,8 +738,9 @@ async def health():
     return {
         "status": "ok",
         "groq": "configured" if GROQ_API_KEY else "not set",
+        "groq_models": GROQ_MODELS,
         "gemini_keys": f"{len(GEMINI_API_KEYS)} configured",
-        "priority": "Groq (llama-3.3-70b first) then Gemini (Flash-Lite first)",
+        "priority": "Groq first (gpt-oss-120b, gpt-oss-20b, qwen), then Gemini as rollback",
     }
 
 
